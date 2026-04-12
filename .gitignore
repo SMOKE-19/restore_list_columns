@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+rust_restore_list_columns/target/
+rust_restore_list_columns/src/restore_list_columns_rs/*.so

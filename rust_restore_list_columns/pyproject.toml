@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "restore_list_columns_rs"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+[tool.maturin]
+python-source = "src"
+include = [
+  { path = "src/restore_list_columns_rs/__init__.pyi", format = "wheel" },
+  { path = "src/restore_list_columns_rs/py.typed", format = "wheel" },
+]
