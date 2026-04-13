@@ -349,14 +349,20 @@ fn restore_batch_columns(
         coord_b_builder.append(true);
     }
 
+    let finished_value_columns: HashMap<String, ArrayRef> = config
+        .value_columns
+        .iter()
+        .cloned()
+        .zip(value_builders.into_iter().map(|(_, builder)| finish_value_column_builder(builder)))
+        .collect();
+
     let mut output_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
     let batch_schema = batch.schema();
     for index in 0..batch.num_columns() {
         let field = batch_schema.field(index);
         let column_name = field.name();
-        if let Some(builder_index) = config.value_columns.iter().position(|name| name == column_name) {
-            let (_, builder) = value_builders.remove(builder_index);
-            output_columns.push(finish_value_column_builder(builder));
+        if let Some(restored_array) = finished_value_columns.get(column_name.as_str()) {
+            output_columns.push(restored_array.clone());
         } else if column_name == &config.coord_columns[0] {
             output_columns.push(Arc::new(coord_a_builder.finish()) as ArrayRef);
         } else if column_name == &config.coord_columns[1] {
