@@ -1,4 +1,4 @@
-use arrow_array::builder::{ListBuilder, PrimitiveBuilder};
+use arrow_array::builder::{ListBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::types::{Float64Type, Int32Type};
 use arrow_array::{Array, ArrayRef, LargeStringArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -10,8 +10,8 @@ use std::fs::File;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::parser::{parse_json_f64_array, parse_json_i32_array};
-use crate::reference::{build_dense_index, load_reference_map, restore_dense_row, DenseReferenceMap};
+use crate::parser::{parse_json_f64_array, parse_json_i32_array, parse_json_string_array};
+use crate::reference::{build_dense_index, load_reference_map, DenseReferenceMap};
 
 const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -23,6 +23,19 @@ struct RestoreConfig {
     value_columns: Vec<String>,
     value_column: Option<String>,
     coord_columns: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ValueColumnKind {
+    Float,
+    Integer,
+    Text,
+}
+
+enum ValueColumnBuilder {
+    Float(ListBuilder<PrimitiveBuilder<Float64Type>>),
+    Integer(ListBuilder<PrimitiveBuilder<Int32Type>>),
+    Text(ListBuilder<StringBuilder>),
 }
 
 fn normalize_dtype(dtype: &str) -> &str {
@@ -79,9 +92,113 @@ fn output_dtype_for_column(
     let output = match normalized {
         "DOUBLE[]" | "FLOAT[]" => DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
         "INTEGER[]" => DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        "TEXT[]" => DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
         _ => input_dtype.clone(),
     };
     Ok(output)
+}
+
+fn value_column_kind(schema: &HashMap<String, String>, column_name: &str) -> pyo3::PyResult<ValueColumnKind> {
+    let Some(raw_dtype) = schema.get(column_name) else {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "missing schema for restore value column {column_name}"
+        )));
+    };
+    match normalize_dtype(raw_dtype) {
+        "DOUBLE[]" | "FLOAT[]" => Ok(ValueColumnKind::Float),
+        "INTEGER[]" => Ok(ValueColumnKind::Integer),
+        "TEXT[]" => Ok(ValueColumnKind::Text),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "restore value column {column_name} must be INTEGER[]/DOUBLE[]/TEXT[], got {other}"
+        ))),
+    }
+}
+
+fn build_value_column_builders(
+    schema: &HashMap<String, String>,
+    value_columns: &[String],
+) -> pyo3::PyResult<Vec<(ValueColumnKind, ValueColumnBuilder)>> {
+    value_columns
+        .iter()
+        .map(|column_name| {
+            let kind = value_column_kind(schema, column_name)?;
+            let builder = match kind {
+                ValueColumnKind::Float => {
+                    ValueColumnBuilder::Float(ListBuilder::new(PrimitiveBuilder::<Float64Type>::new()))
+                }
+                ValueColumnKind::Integer => {
+                    ValueColumnBuilder::Integer(ListBuilder::new(PrimitiveBuilder::<Int32Type>::new()))
+                }
+                ValueColumnKind::Text => ValueColumnBuilder::Text(ListBuilder::new(StringBuilder::new())),
+            };
+            Ok((kind, builder))
+        })
+        .collect()
+}
+
+fn restore_dense_values<T: Clone>(
+    value_sparse: &[T],
+    coord_a_sparse: &[i32],
+    coord_b_sparse: &[i32],
+    dense_index: &HashMap<(i32, i32), usize>,
+    dense_len: usize,
+) -> Vec<Option<T>> {
+    let sparse_len = value_sparse
+        .len()
+        .min(coord_a_sparse.len())
+        .min(coord_b_sparse.len());
+    let mut dense = vec![None; dense_len];
+    for idx in 0..sparse_len {
+        let key = (coord_a_sparse[idx], coord_b_sparse[idx]);
+        if let Some(&dense_pos) = dense_index.get(&key) {
+            dense[dense_pos] = Some(value_sparse[idx].clone());
+        }
+    }
+    dense
+}
+
+fn append_float_dense(
+    builder: &mut ListBuilder<PrimitiveBuilder<Float64Type>>,
+    dense_value: Vec<Option<f64>>,
+) {
+    for item in dense_value {
+        match item {
+            Some(value) => builder.values().append_value(value),
+            None => builder.values().append_null(),
+        }
+    }
+    builder.append(true);
+}
+
+fn append_int_dense(
+    builder: &mut ListBuilder<PrimitiveBuilder<Int32Type>>,
+    dense_value: Vec<Option<i32>>,
+) {
+    for item in dense_value {
+        match item {
+            Some(value) => builder.values().append_value(value),
+            None => builder.values().append_null(),
+        }
+    }
+    builder.append(true);
+}
+
+fn append_text_dense(builder: &mut ListBuilder<StringBuilder>, dense_value: Vec<Option<String>>) {
+    for item in dense_value {
+        match item {
+            Some(value) => builder.values().append_value(value),
+            None => builder.values().append_null(),
+        }
+    }
+    builder.append(true);
+}
+
+fn finish_value_column_builder(builder: ValueColumnBuilder) -> ArrayRef {
+    match builder {
+        ValueColumnBuilder::Float(mut inner) => Arc::new(inner.finish()) as ArrayRef,
+        ValueColumnBuilder::Integer(mut inner) => Arc::new(inner.finish()) as ArrayRef,
+        ValueColumnBuilder::Text(mut inner) => Arc::new(inner.finish()) as ArrayRef,
+    }
 }
 
 fn batch_string_values(batch: &RecordBatch, name: &str, input_path: &str) -> pyo3::PyResult<Vec<String>> {
@@ -147,6 +264,7 @@ fn restore_batch_columns(
     batch: &RecordBatch,
     input_path: &str,
     config: &RestoreConfig,
+    schema: &HashMap<String, String>,
     refs: &DenseReferenceMap,
     dense_index_cache: &HashMap<String, HashMap<(i32, i32), usize>>,
     output_schema: Arc<Schema>,
@@ -160,11 +278,7 @@ fn restore_batch_columns(
     let coord_a_sparse_json = batch_string_values(batch, &config.coord_columns[0], input_path)?;
     let coord_b_sparse_json = batch_string_values(batch, &config.coord_columns[1], input_path)?;
 
-    let mut value_builders: Vec<ListBuilder<PrimitiveBuilder<Float64Type>>> = config
-        .value_columns
-        .iter()
-        .map(|_| ListBuilder::new(PrimitiveBuilder::<Float64Type>::new()))
-        .collect();
+    let mut value_builders = build_value_column_builders(schema, &config.value_columns)?;
     let mut coord_a_builder = ListBuilder::new(PrimitiveBuilder::<Int32Type>::new());
     let mut coord_b_builder = ListBuilder::new(PrimitiveBuilder::<Int32Type>::new());
 
@@ -180,23 +294,48 @@ fn restore_batch_columns(
         let coord_a_sparse = parse_json_i32_array(&coord_a_sparse_json[row_index])?;
         let coord_b_sparse = parse_json_i32_array(&coord_b_sparse_json[row_index])?;
 
-        for (builder, value_sparse_json) in value_builders.iter_mut().zip(value_sparse_jsons.iter()) {
-            let value_sparse = parse_json_f64_array(&value_sparse_json[row_index])?;
-            let dense_value = restore_dense_row(
-                &value_sparse,
-                &coord_a_sparse,
-                &coord_b_sparse,
-                dense_index,
-                dense_coord_a.len(),
-            );
-
-            for item in dense_value {
-                match item {
-                    Some(value) => builder.values().append_value(value),
-                    None => builder.values().append_null(),
+        for ((kind, builder), value_sparse_json) in value_builders.iter_mut().zip(value_sparse_jsons.iter()) {
+            match kind {
+                ValueColumnKind::Float => {
+                    let value_sparse = parse_json_f64_array(&value_sparse_json[row_index])?;
+                    let dense_value = restore_dense_values(
+                        &value_sparse,
+                        &coord_a_sparse,
+                        &coord_b_sparse,
+                        dense_index,
+                        dense_coord_a.len(),
+                    );
+                    if let ValueColumnBuilder::Float(inner) = builder {
+                        append_float_dense(inner, dense_value);
+                    }
+                }
+                ValueColumnKind::Integer => {
+                    let value_sparse = parse_json_i32_array(&value_sparse_json[row_index])?;
+                    let dense_value = restore_dense_values(
+                        &value_sparse,
+                        &coord_a_sparse,
+                        &coord_b_sparse,
+                        dense_index,
+                        dense_coord_a.len(),
+                    );
+                    if let ValueColumnBuilder::Integer(inner) = builder {
+                        append_int_dense(inner, dense_value);
+                    }
+                }
+                ValueColumnKind::Text => {
+                    let value_sparse = parse_json_string_array(&value_sparse_json[row_index])?;
+                    let dense_value = restore_dense_values(
+                        &value_sparse,
+                        &coord_a_sparse,
+                        &coord_b_sparse,
+                        dense_index,
+                        dense_coord_a.len(),
+                    );
+                    if let ValueColumnBuilder::Text(inner) = builder {
+                        append_text_dense(inner, dense_value);
+                    }
                 }
             }
-            builder.append(true);
         }
 
         for item in dense_coord_a {
@@ -216,7 +355,8 @@ fn restore_batch_columns(
         let field = batch_schema.field(index);
         let column_name = field.name();
         if let Some(builder_index) = config.value_columns.iter().position(|name| name == column_name) {
-            output_columns.push(Arc::new(value_builders[builder_index].finish()) as ArrayRef);
+            let (_, builder) = value_builders.remove(builder_index);
+            output_columns.push(finish_value_column_builder(builder));
         } else if column_name == &config.coord_columns[0] {
             output_columns.push(Arc::new(coord_a_builder.finish()) as ArrayRef);
         } else if column_name == &config.coord_columns[1] {
@@ -303,6 +443,7 @@ pub fn restore_parquet_to_parquet_impl(
             &batch,
             &input_parquet_path,
             &config,
+            &schema,
             &refs,
             &dense_index_cache,
             output_schema.clone(),

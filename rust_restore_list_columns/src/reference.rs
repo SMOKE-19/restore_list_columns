@@ -3,7 +3,6 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 
-pub type DenseRow = Vec<Option<f64>>;
 pub type DenseReferenceMap = HashMap<String, (Vec<i32>, Vec<i32>)>;
 
 fn batch_column_index(batch: &RecordBatch, name: &str, lookup_path: &str) -> pyo3::PyResult<usize> {
@@ -162,25 +161,4 @@ pub fn build_dense_index(
         index.insert((coord_a, coord_b), position);
     }
     Ok(index)
-}
-
-pub fn restore_dense_row(
-    value_sparse: &[f64],
-    coord_a_sparse: &[i32],
-    coord_b_sparse: &[i32],
-    dense_index: &HashMap<(i32, i32), usize>,
-    dense_len: usize,
-) -> DenseRow {
-    let sparse_len = value_sparse
-        .len()
-        .min(coord_a_sparse.len())
-        .min(coord_b_sparse.len());
-    let mut dense = vec![None; dense_len];
-    for idx in 0..sparse_len {
-        let key = (coord_a_sparse[idx], coord_b_sparse[idx]);
-        if let Some(&dense_pos) = dense_index.get(&key) {
-            dense[dense_pos] = Some(value_sparse[idx]);
-        }
-    }
-    dense
 }
