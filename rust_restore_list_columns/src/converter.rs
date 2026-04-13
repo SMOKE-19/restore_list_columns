@@ -19,7 +19,9 @@ const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 struct RestoreConfig {
     key_column: String,
     order_column: String,
-    value_column: String,
+    #[serde(default)]
+    value_columns: Vec<String>,
+    value_column: Option<String>,
     coord_columns: Vec<String>,
 }
 
@@ -43,7 +45,7 @@ fn normalize_dtype(dtype: &str) -> &str {
 }
 
 fn parse_config(config_json: &str) -> pyo3::PyResult<RestoreConfig> {
-    let config: RestoreConfig = serde_json::from_str(config_json).map_err(|err| {
+    let mut config: RestoreConfig = serde_json::from_str(config_json).map_err(|err| {
         pyo3::exceptions::PyValueError::new_err(format!("invalid restore config: {err}"))
     })?;
     if config.coord_columns.len() != 2 {
@@ -51,6 +53,16 @@ fn parse_config(config_json: &str) -> pyo3::PyResult<RestoreConfig> {
             "coord_columns must contain exactly 2 items, got {}",
             config.coord_columns.len()
         )));
+    }
+    if config.value_columns.is_empty() {
+        if let Some(value_column) = config.value_column.clone() {
+            config.value_columns.push(value_column);
+        }
+    }
+    if config.value_columns.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "value_column 또는 value_columns 를 반드시 지정해야 합니다.",
+        ));
     }
     Ok(config)
 }
@@ -140,11 +152,19 @@ fn restore_batch_columns(
     output_schema: Arc<Schema>,
 ) -> pyo3::PyResult<RecordBatch> {
     let key_values = batch_string_values(batch, &config.key_column, input_path)?;
-    let value_sparse_json = batch_string_values(batch, &config.value_column, input_path)?;
+    let value_sparse_jsons: Vec<Vec<String>> = config
+        .value_columns
+        .iter()
+        .map(|column_name| batch_string_values(batch, column_name, input_path))
+        .collect::<pyo3::PyResult<Vec<_>>>()?;
     let coord_a_sparse_json = batch_string_values(batch, &config.coord_columns[0], input_path)?;
     let coord_b_sparse_json = batch_string_values(batch, &config.coord_columns[1], input_path)?;
 
-    let mut value_builder = ListBuilder::new(PrimitiveBuilder::<Float64Type>::new());
+    let mut value_builders: Vec<ListBuilder<PrimitiveBuilder<Float64Type>>> = config
+        .value_columns
+        .iter()
+        .map(|_| ListBuilder::new(PrimitiveBuilder::<Float64Type>::new()))
+        .collect();
     let mut coord_a_builder = ListBuilder::new(PrimitiveBuilder::<Int32Type>::new());
     let mut coord_b_builder = ListBuilder::new(PrimitiveBuilder::<Int32Type>::new());
 
@@ -157,24 +177,27 @@ fn restore_batch_columns(
             pyo3::exceptions::PyValueError::new_err(format!("missing dense index for lookup key '{group_key}'"))
         })?;
 
-        let value_sparse = parse_json_f64_array(&value_sparse_json[row_index])?;
         let coord_a_sparse = parse_json_i32_array(&coord_a_sparse_json[row_index])?;
         let coord_b_sparse = parse_json_i32_array(&coord_b_sparse_json[row_index])?;
-        let dense_value = restore_dense_row(
-            &value_sparse,
-            &coord_a_sparse,
-            &coord_b_sparse,
-            dense_index,
-            dense_coord_a.len(),
-        );
 
-        for item in dense_value {
-            match item {
-                Some(value) => value_builder.values().append_value(value),
-                None => value_builder.values().append_null(),
+        for (builder, value_sparse_json) in value_builders.iter_mut().zip(value_sparse_jsons.iter()) {
+            let value_sparse = parse_json_f64_array(&value_sparse_json[row_index])?;
+            let dense_value = restore_dense_row(
+                &value_sparse,
+                &coord_a_sparse,
+                &coord_b_sparse,
+                dense_index,
+                dense_coord_a.len(),
+            );
+
+            for item in dense_value {
+                match item {
+                    Some(value) => builder.values().append_value(value),
+                    None => builder.values().append_null(),
+                }
             }
+            builder.append(true);
         }
-        value_builder.append(true);
 
         for item in dense_coord_a {
             coord_a_builder.values().append_value(*item);
@@ -192,8 +215,8 @@ fn restore_batch_columns(
     for index in 0..batch.num_columns() {
         let field = batch_schema.field(index);
         let column_name = field.name();
-        if column_name == &config.value_column {
-            output_columns.push(Arc::new(value_builder.finish()) as ArrayRef);
+        if let Some(builder_index) = config.value_columns.iter().position(|name| name == column_name) {
+            output_columns.push(Arc::new(value_builders[builder_index].finish()) as ArrayRef);
         } else if column_name == &config.coord_columns[0] {
             output_columns.push(Arc::new(coord_a_builder.finish()) as ArrayRef);
         } else if column_name == &config.coord_columns[1] {
