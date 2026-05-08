@@ -38,6 +38,20 @@ enum ValueColumnBuilder {
     Text(ListBuilder<StringBuilder>),
 }
 
+#[derive(Default)]
+struct DetailedProfile {
+    batches_processed: usize,
+    input_rows: usize,
+    max_batch_rows: usize,
+    max_dense_len: usize,
+    max_restored_batch_array_bytes: usize,
+    sum_restored_batch_array_bytes: usize,
+    source_extract_sec: f64,
+    dense_restore_sec: f64,
+    record_batch_build_sec: f64,
+    writer_write_sec: f64,
+}
+
 fn normalize_dtype(dtype: &str) -> &str {
     match dtype {
         "TEXT" | "Utf8" | "String" => "TEXT",
@@ -268,7 +282,9 @@ fn restore_batch_columns(
     refs: &DenseReferenceMap,
     dense_index_cache: &HashMap<String, HashMap<(i32, i32), usize>>,
     output_schema: Arc<Schema>,
+    detailed_profile: Option<&mut DetailedProfile>,
 ) -> pyo3::PyResult<RecordBatch> {
+    let extract_started = Instant::now();
     let key_values = batch_string_values(batch, &config.key_column, input_path)?;
     let value_sparse_jsons: Vec<Vec<String>> = config
         .value_columns
@@ -277,11 +293,13 @@ fn restore_batch_columns(
         .collect::<pyo3::PyResult<Vec<_>>>()?;
     let coord_a_sparse_json = batch_string_values(batch, &config.coord_columns[0], input_path)?;
     let coord_b_sparse_json = batch_string_values(batch, &config.coord_columns[1], input_path)?;
+    let extract_sec = extract_started.elapsed().as_secs_f64();
 
     let mut value_builders = build_value_column_builders(schema, &config.value_columns)?;
     let mut coord_a_builder = ListBuilder::new(PrimitiveBuilder::<Int32Type>::new());
     let mut coord_b_builder = ListBuilder::new(PrimitiveBuilder::<Int32Type>::new());
 
+    let dense_restore_started = Instant::now();
     for row_index in 0..batch.num_rows() {
         let group_key = &key_values[row_index];
         let (dense_coord_a, dense_coord_b) = refs.get(group_key).ok_or_else(|| {
@@ -348,6 +366,7 @@ fn restore_batch_columns(
         }
         coord_b_builder.append(true);
     }
+    let dense_restore_sec = dense_restore_started.elapsed().as_secs_f64();
 
     let finished_value_columns: HashMap<String, ArrayRef> = config
         .value_columns
@@ -372,20 +391,41 @@ fn restore_batch_columns(
         }
     }
 
-    RecordBatch::try_new(output_schema, output_columns).map_err(|err| {
+    let build_started = Instant::now();
+    let restored_batch = RecordBatch::try_new(output_schema, output_columns).map_err(|err| {
         pyo3::exceptions::PyValueError::new_err(format!(
             "failed to build restored record batch for {input_path}: {err}"
         ))
-    })
+    })?;
+    let build_sec = build_started.elapsed().as_secs_f64();
+
+    if let Some(profile) = detailed_profile {
+        profile.batches_processed += 1;
+        profile.input_rows += batch.num_rows();
+        profile.max_batch_rows = profile.max_batch_rows.max(batch.num_rows());
+        profile.max_dense_len = profile.max_dense_len.max(
+            refs.values()
+                .map(|(coord_a, _)| coord_a.len())
+                .max()
+                .unwrap_or(0),
+        );
+        profile.source_extract_sec += extract_sec;
+        profile.dense_restore_sec += dense_restore_sec;
+        profile.record_batch_build_sec += build_sec;
+    }
+
+    Ok(restored_batch)
 }
 
-pub fn restore_parquet_to_parquet_impl(
+fn restore_parquet_to_parquet_internal(
     input_parquet_path: String,
     output_parquet_path: String,
     lookup_path: String,
     schema: HashMap<String, String>,
     config_json: String,
+    batch_size: Option<usize>,
     print_timing: bool,
+    detailed: bool,
 ) -> pyo3::PyResult<HashMap<String, f64>> {
     if print_timing {
         println!(
@@ -414,11 +454,14 @@ pub fn restore_parquet_to_parquet_impl(
             "failed to open input parquet {input_parquet_path}: {err}"
         ))
     })?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(input_file).map_err(|err| {
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new(input_file).map_err(|err| {
         pyo3::exceptions::PyValueError::new_err(format!(
             "failed to initialize parquet reader {input_parquet_path}: {err}"
         ))
     })?;
+    if let Some(size) = batch_size {
+        builder = builder.with_batch_size(size);
+    }
     let output_schema = build_output_schema(builder.schema().as_ref(), &schema)?;
     let reader = builder.build().map_err(|err| {
         pyo3::exceptions::PyValueError::new_err(format!(
@@ -439,6 +482,7 @@ pub fn restore_parquet_to_parquet_impl(
 
     let restore_started = Instant::now();
     let mut rows_written = 0usize;
+    let mut detailed_profile = DetailedProfile::default();
     for batch_result in reader {
         let batch = batch_result.map_err(|err| {
             pyo3::exceptions::PyValueError::new_err(format!(
@@ -453,13 +497,25 @@ pub fn restore_parquet_to_parquet_impl(
             &refs,
             &dense_index_cache,
             output_schema.clone(),
+            if detailed { Some(&mut detailed_profile) } else { None },
         )?;
         rows_written += restored.num_rows();
+        if detailed {
+            let restored_batch_array_bytes = restored.get_array_memory_size();
+            detailed_profile.max_restored_batch_array_bytes = detailed_profile
+                .max_restored_batch_array_bytes
+                .max(restored_batch_array_bytes);
+            detailed_profile.sum_restored_batch_array_bytes += restored_batch_array_bytes;
+        }
+        let writer_write_started = Instant::now();
         writer.write(&restored).map_err(|err| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "failed to write restored parquet batch {output_parquet_path}: {err}"
             ))
         })?;
+        if detailed {
+            detailed_profile.writer_write_sec += writer_write_started.elapsed().as_secs_f64();
+        }
     }
     let restore_sec = restore_started.elapsed().as_secs_f64();
     if print_timing {
@@ -488,5 +544,73 @@ pub fn restore_parquet_to_parquet_impl(
     stats.insert("restore_sec".to_string(), restore_sec);
     stats.insert("parquet_write_sec".to_string(), parquet_write_sec);
     stats.insert("total_sec".to_string(), total_sec);
+    if detailed {
+        stats.insert("batches_processed".to_string(), detailed_profile.batches_processed as f64);
+        stats.insert("input_rows".to_string(), detailed_profile.input_rows as f64);
+        stats.insert("max_batch_rows".to_string(), detailed_profile.max_batch_rows as f64);
+        stats.insert("max_dense_len".to_string(), detailed_profile.max_dense_len as f64);
+        stats.insert(
+            "max_restored_batch_array_bytes".to_string(),
+            detailed_profile.max_restored_batch_array_bytes as f64,
+        );
+        stats.insert(
+            "avg_restored_batch_array_bytes".to_string(),
+            if detailed_profile.batches_processed == 0 {
+                0.0
+            } else {
+                detailed_profile.sum_restored_batch_array_bytes as f64
+                    / detailed_profile.batches_processed as f64
+            },
+        );
+        stats.insert("value_column_count".to_string(), config.value_columns.len() as f64);
+        stats.insert("source_extract_sec".to_string(), detailed_profile.source_extract_sec);
+        stats.insert("dense_restore_sec".to_string(), detailed_profile.dense_restore_sec);
+        stats.insert("record_batch_build_sec".to_string(), detailed_profile.record_batch_build_sec);
+        stats.insert("writer_write_sec".to_string(), detailed_profile.writer_write_sec);
+        if let Ok(metadata) = std::fs::metadata(&output_parquet_path) {
+            stats.insert("output_file_size_bytes".to_string(), metadata.len() as f64);
+        }
+    }
     Ok(stats)
+}
+
+pub fn restore_parquet_to_parquet_impl(
+    input_parquet_path: String,
+    output_parquet_path: String,
+    lookup_path: String,
+    schema: HashMap<String, String>,
+    config_json: String,
+    batch_size: Option<usize>,
+    print_timing: bool,
+) -> pyo3::PyResult<HashMap<String, f64>> {
+    restore_parquet_to_parquet_internal(
+        input_parquet_path,
+        output_parquet_path,
+        lookup_path,
+        schema,
+        config_json,
+        batch_size,
+        print_timing,
+        false,
+    )
+}
+
+pub fn restore_parquet_to_parquet_profiled_impl(
+    input_parquet_path: String,
+    output_parquet_path: String,
+    lookup_path: String,
+    schema: HashMap<String, String>,
+    config_json: String,
+    batch_size: Option<usize>,
+) -> pyo3::PyResult<HashMap<String, f64>> {
+    restore_parquet_to_parquet_internal(
+        input_parquet_path,
+        output_parquet_path,
+        lookup_path,
+        schema,
+        config_json,
+        batch_size,
+        false,
+        true,
+    )
 }
