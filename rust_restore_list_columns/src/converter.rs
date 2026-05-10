@@ -2,11 +2,13 @@ use arrow_array::builder::{ListBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::types::{Float64Type, Int32Type};
 use arrow_array::{Array, ArrayRef, LargeStringArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use libc::{off_t, posix_fadvise, POSIX_FADV_DONTNEED};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -50,6 +52,8 @@ struct DetailedProfile {
     dense_restore_sec: f64,
     record_batch_build_sec: f64,
     writer_write_sec: f64,
+    cache_hint_sec: f64,
+    cache_hint_calls: usize,
 }
 
 fn normalize_dtype(dtype: &str) -> &str {
@@ -92,6 +96,13 @@ fn parse_config(config_json: &str) -> pyo3::PyResult<RestoreConfig> {
         ));
     }
     Ok(config)
+}
+
+fn drop_file_cache_hint(file: &File) {
+    let fd = file.as_raw_fd();
+    unsafe {
+        let _ = posix_fadvise(fd, 0 as off_t, 0 as off_t, POSIX_FADV_DONTNEED);
+    }
 }
 
 fn output_dtype_for_column(
@@ -424,6 +435,7 @@ fn restore_parquet_to_parquet_internal(
     schema: HashMap<String, String>,
     config_json: String,
     batch_size: Option<usize>,
+    drop_cache_hint: bool,
     print_timing: bool,
     detailed: bool,
 ) -> pyo3::PyResult<HashMap<String, f64>> {
@@ -538,6 +550,25 @@ fn restore_parquet_to_parquet_internal(
         println!("[restore_list_columns_rs] total_sec={total_sec:.6}");
     }
 
+    if drop_cache_hint {
+        let cache_hint_started = Instant::now();
+        if let Ok(file) = File::open(&input_parquet_path) {
+            drop_file_cache_hint(&file);
+            if detailed {
+                detailed_profile.cache_hint_calls += 1;
+            }
+        }
+        if let Ok(file) = File::open(&output_parquet_path) {
+            drop_file_cache_hint(&file);
+            if detailed {
+                detailed_profile.cache_hint_calls += 1;
+            }
+        }
+        if detailed {
+            detailed_profile.cache_hint_sec += cache_hint_started.elapsed().as_secs_f64();
+        }
+    }
+
     let mut stats = HashMap::new();
     stats.insert("rows_written".to_string(), rows_written as f64);
     stats.insert("reference_load_sec".to_string(), reference_load_sec);
@@ -567,6 +598,8 @@ fn restore_parquet_to_parquet_internal(
         stats.insert("dense_restore_sec".to_string(), detailed_profile.dense_restore_sec);
         stats.insert("record_batch_build_sec".to_string(), detailed_profile.record_batch_build_sec);
         stats.insert("writer_write_sec".to_string(), detailed_profile.writer_write_sec);
+        stats.insert("cache_hint_sec".to_string(), detailed_profile.cache_hint_sec);
+        stats.insert("cache_hint_calls".to_string(), detailed_profile.cache_hint_calls as f64);
         if let Ok(metadata) = std::fs::metadata(&output_parquet_path) {
             stats.insert("output_file_size_bytes".to_string(), metadata.len() as f64);
         }
@@ -581,6 +614,7 @@ pub fn restore_parquet_to_parquet_impl(
     schema: HashMap<String, String>,
     config_json: String,
     batch_size: Option<usize>,
+    drop_cache_hint: bool,
     print_timing: bool,
 ) -> pyo3::PyResult<HashMap<String, f64>> {
     restore_parquet_to_parquet_internal(
@@ -590,6 +624,7 @@ pub fn restore_parquet_to_parquet_impl(
         schema,
         config_json,
         batch_size,
+        drop_cache_hint,
         print_timing,
         false,
     )
@@ -602,6 +637,7 @@ pub fn restore_parquet_to_parquet_profiled_impl(
     schema: HashMap<String, String>,
     config_json: String,
     batch_size: Option<usize>,
+    drop_cache_hint: bool,
 ) -> pyo3::PyResult<HashMap<String, f64>> {
     restore_parquet_to_parquet_internal(
         input_parquet_path,
@@ -610,6 +646,7 @@ pub fn restore_parquet_to_parquet_profiled_impl(
         schema,
         config_json,
         batch_size,
+        drop_cache_hint,
         false,
         true,
     )

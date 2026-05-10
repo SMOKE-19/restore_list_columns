@@ -23,7 +23,7 @@ __all__ = [
 __version__ = "0.1.1"
 
 def _restore_parquet_to_parquet_worker(args: tuple[str, str, str, dict[str, str], dict[str, object], int | None, bool]) -> dict[str, float]:
-    input_parquet_path, output_parquet_path, lookup_path, schema, config, batch_size, print_timing = args
+    input_parquet_path, output_parquet_path, lookup_path, schema, config, batch_size, drop_cache_hint, print_timing = args
     return _restore_parquet_impl(
         input_parquet_path,
         output_parquet_path,
@@ -31,15 +31,16 @@ def _restore_parquet_to_parquet_worker(args: tuple[str, str, str, dict[str, str]
         schema,
         config,
         batch_size=batch_size,
+        drop_cache_hint=drop_cache_hint,
         print_timing=print_timing,
         profiled=False,
     )
 
 
 def _restore_parquet_to_parquet_profiled_worker(
-    args: tuple[str, str, str, dict[str, str], dict[str, object], int | None]
+    args: tuple[str, str, str, dict[str, str], dict[str, object], int | None, bool]
 ) -> dict[str, float]:
-    input_parquet_path, output_parquet_path, lookup_path, schema, config, batch_size = args
+    input_parquet_path, output_parquet_path, lookup_path, schema, config, batch_size, drop_cache_hint = args
     return _restore_parquet_impl(
         input_parquet_path,
         output_parquet_path,
@@ -47,6 +48,7 @@ def _restore_parquet_to_parquet_profiled_worker(
         schema,
         config,
         batch_size=batch_size,
+        drop_cache_hint=drop_cache_hint,
         print_timing=False,
         profiled=True,
     )
@@ -60,6 +62,7 @@ def _restore_parquet_impl(
     config: Mapping[str, object],
     *,
     batch_size: int | None,
+    drop_cache_hint: bool,
     print_timing: bool,
     profiled: bool,
 ) -> dict[str, float]:
@@ -72,6 +75,7 @@ def _restore_parquet_impl(
             schema,
             config_json,
             batch_size,
+            drop_cache_hint,
         )
     return _restore_parquet_to_parquet_impl(
         input_parquet_path,
@@ -80,6 +84,7 @@ def _restore_parquet_impl(
         schema,
         config_json,
         batch_size,
+        drop_cache_hint,
         print_timing,
     )
 
@@ -91,6 +96,7 @@ def restore_parquet_to_parquet(
     schema: dict[str, str],
     config: Mapping[str, object],
     batch_size: int | None = None,
+    drop_cache_hint: bool = False,
     print_timing: bool = False,
 ) -> dict[str, float]:
     return _restore_parquet_impl(
@@ -100,6 +106,7 @@ def restore_parquet_to_parquet(
         schema,
         config,
         batch_size=batch_size,
+        drop_cache_hint=drop_cache_hint,
         print_timing=print_timing,
         profiled=False,
     )
@@ -113,6 +120,7 @@ def restore_dataset_to_dataset(
     config: Mapping[str, object],
     batch_size: int | None = None,
     max_workers: int = 1,
+    drop_cache_hint: bool = False,
     print_timing: bool = False,
 ) -> dict[str, float]:
     input_dir = Path(input_dataset_dir)
@@ -139,6 +147,7 @@ def restore_dataset_to_dataset(
             schema,
             dict(config),
             batch_size,
+            drop_cache_hint,
             print_timing,
         )
         for input_path in part_files
@@ -162,6 +171,7 @@ def restore_parquet_to_parquet_profiled(
     schema: dict[str, str],
     config: Mapping[str, object],
     batch_size: int | None = None,
+    drop_cache_hint: bool = False,
 ) -> dict[str, float]:
     return _restore_parquet_impl(
         input_parquet_path,
@@ -170,6 +180,7 @@ def restore_parquet_to_parquet_profiled(
         schema,
         config,
         batch_size=batch_size,
+        drop_cache_hint=drop_cache_hint,
         print_timing=False,
         profiled=True,
     )
@@ -183,6 +194,7 @@ def restore_dataset_to_dataset_profiled(
     config: Mapping[str, object],
     batch_size: int | None = None,
     max_workers: int = 1,
+    drop_cache_hint: bool = False,
 ) -> dict[str, object]:
     input_dir = Path(input_dataset_dir)
     output_dir = Path(output_dataset_dir)
@@ -205,6 +217,8 @@ def restore_dataset_to_dataset_profiled(
         "dense_restore_sec": 0.0,
         "record_batch_build_sec": 0.0,
         "writer_write_sec": 0.0,
+        "cache_hint_sec": 0.0,
+        "cache_hint_calls": 0.0,
     }
     avg_accumulators: dict[str, float] = {"avg_restored_batch_array_bytes": 0.0}
     max_keys = {
@@ -223,6 +237,7 @@ def restore_dataset_to_dataset_profiled(
             schema,
             dict(config),
             batch_size,
+            drop_cache_hint,
         )
         for input_path in part_files
     ]

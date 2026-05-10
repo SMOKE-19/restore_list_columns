@@ -7,6 +7,7 @@ def restore_parquet_to_parquet(
     schema: dict[str, str],
     config: Mapping[str, object],
     batch_size: int | None = ...,
+    drop_cache_hint: bool = ...,
     print_timing: bool = ...,
 ) -> dict[str, float]: ...
 
@@ -17,6 +18,7 @@ def restore_parquet_to_parquet_profiled(
     schema: dict[str, str],
     config: Mapping[str, object],
     batch_size: int | None = ...,
+    drop_cache_hint: bool = ...,
 ) -> dict[str, float]: ...
 
 def restore_dataset_to_dataset(
@@ -27,6 +29,7 @@ def restore_dataset_to_dataset(
     config: Mapping[str, object],
     batch_size: int | None = ...,
     max_workers: int = ...,
+    drop_cache_hint: bool = ...,
     print_timing: bool = ...,
 ) -> dict[str, float]: ...
 
@@ -38,4 +41,5 @@ def restore_dataset_to_dataset_profiled(
     config: Mapping[str, object],
     batch_size: int | None = ...,
     max_workers: int = ...,
+    drop_cache_hint: bool = ...,
 ) -> dict[str, object]: ...
