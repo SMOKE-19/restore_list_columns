@@ -8,18 +8,20 @@ on:
 
 jobs:
   rust-and-wheel:
+    name: Build ${{ matrix.os }} wheel for Python ${{ matrix.python-version }}
     strategy:
       fail-fast: false
       matrix:
         os:
           - ubuntu-latest
           - windows-latest
+        python-version:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
 
     runs-on: ${{ matrix.os }}
-
-    defaults:
-      run:
-        working-directory: rust_restore_list_columns
 
     steps:
       - name: Checkout
@@ -28,16 +30,26 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install maturin
-        run: python -m pip install --upgrade pip maturin
-
       - name: Cargo check
+        working-directory: rust_restore_list_columns
         run: cargo check
 
       - name: Build wheel
-        run: maturin build --release
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: rust_restore_list_columns
+          command: build
+          manylinux: auto
+          args: --release --out dist --interpreter ${{ matrix.os == 'windows-latest' && 'python' || format('python{0}', matrix['python-version']) }}
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: rust_restore_list_columns/dist/*.whl
+          if-no-files-found: error
