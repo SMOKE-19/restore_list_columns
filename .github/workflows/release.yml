@@ -10,59 +10,75 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build release wheel on ${{ matrix.os }} for Python ${{ matrix.python-version }}
+  build-linux:
+    name: Build Linux wheel for Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
-        python-version:
-          - "3.10"
-          - "3.11"
-          - "3.12"
-          - "3.13"
-
-    runs-on: ${{ matrix.os }}
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build wheels
+      - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           working-directory: rust_restore_list_columns
           command: build
+          args: --release --out dist --interpreter python${{ matrix.python-version }}
           manylinux: auto
-          args: --release --out dist --interpreter ${{ matrix.os == 'windows-latest' && 'python' || format('python{0}', matrix['python-version']) }}
 
-      - name: Upload dist artifacts
+      - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}-py${{ matrix.python-version }}
+          name: wheels-linux-py${{ matrix.python-version }}
+          path: rust_restore_list_columns/dist/*.whl
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows wheel for Python ${{ matrix.python-version }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: rust_restore_list_columns
+          command: build
+          args: --release --out dist --interpreter python
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-py${{ matrix.python-version }}
           path: rust_restore_list_columns/dist/*.whl
           if-no-files-found: error
 
   publish-release:
-    needs: build
+    needs:
+      - build-linux
+      - build-windows
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
