@@ -2,12 +2,14 @@ use arrow_array::builder::{ListBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::types::{Float64Type, Int32Type};
 use arrow_array::{Array, ArrayRef, LargeStringArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+#[cfg(unix)]
 use libc::{off_t, posix_fadvise, POSIX_FADV_DONTNEED};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::Instant;
@@ -98,12 +100,16 @@ fn parse_config(config_json: &str) -> pyo3::PyResult<RestoreConfig> {
     Ok(config)
 }
 
+#[cfg(unix)]
 fn drop_file_cache_hint(file: &File) {
     let fd = file.as_raw_fd();
     unsafe {
         let _ = posix_fadvise(fd, 0 as off_t, 0 as off_t, POSIX_FADV_DONTNEED);
     }
 }
+
+#[cfg(not(unix))]
+fn drop_file_cache_hint(_file: &File) {}
 
 fn output_dtype_for_column(
     schema: &HashMap<String, String>,
