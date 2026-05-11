@@ -105,6 +105,6 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
-          artifacts: "dist/*"
+          files: "dist/*"
           generate_release_notes: true
           fail_on_unmatched_files: true
