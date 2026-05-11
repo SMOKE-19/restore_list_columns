@@ -17,6 +17,10 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    defaults:
+      run:
+        working-directory: rust_restore_list_columns
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
