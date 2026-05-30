@@ -8,19 +8,37 @@ from pathlib import Path
 from typing import Mapping
 
 from .restore_list_columns_rs import (
+    plan_restore_coords as _plan_restore_coords_impl,
     restore_parquet_to_parquet as _restore_parquet_to_parquet_impl,
     restore_parquet_to_parquet_profiled as _restore_parquet_to_parquet_profiled_impl,
+    restore_with_coord_file as _restore_with_coord_file_impl,
 )
 
 __all__ = [
     "__version__",
+    "plan_restore_coords",
     "restore_dataset_to_dataset",
     "restore_dataset_to_dataset_profiled",
     "restore_parquet_to_parquet",
     "restore_parquet_to_parquet_profiled",
+    "restore_with_coord_file",
 ]
 
 __version__ = "0.1.1"
+
+
+def plan_restore_coords(
+    input_parquet_paths: list[str],
+    coord_output_dir: str,
+    filter_config: Mapping[str, object] | None = None,
+    planner_config: Mapping[str, object] | None = None,
+) -> dict[str, float]:
+    return _plan_restore_coords_impl(
+        [str(item) for item in input_parquet_paths],
+        coord_output_dir,
+        json.dumps(dict(filter_config or {}), ensure_ascii=True),
+        json.dumps(dict(planner_config or {}), ensure_ascii=True),
+    )
 
 def _restore_parquet_to_parquet_worker(args: tuple[str, str, str, dict[str, str], dict[str, object], int | None, bool]) -> dict[str, float]:
     input_parquet_path, output_parquet_path, lookup_path, schema, config, batch_size, drop_cache_hint, print_timing = args
@@ -109,6 +127,30 @@ def restore_parquet_to_parquet(
         drop_cache_hint=drop_cache_hint,
         print_timing=print_timing,
         profiled=False,
+    )
+
+
+def restore_with_coord_file(
+    coord_path: str,
+    output_dir: str,
+    lookup_path: str,
+    schema: dict[str, str],
+    config: Mapping[str, object],
+    writer_config: Mapping[str, object] | None = None,
+    batch_size: int | None = None,
+    drop_cache_hint: bool = False,
+    print_timing: bool = False,
+) -> dict[str, float]:
+    return _restore_with_coord_file_impl(
+        coord_path,
+        output_dir,
+        lookup_path,
+        schema,
+        json.dumps(config, ensure_ascii=True),
+        json.dumps(dict(writer_config or {}), ensure_ascii=True),
+        batch_size,
+        drop_cache_hint,
+        print_timing,
     )
 
 
