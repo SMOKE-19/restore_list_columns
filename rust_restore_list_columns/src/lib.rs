@@ -110,7 +110,10 @@ fn restore_list_columns_rs(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyR
         "Rust module for restoring sparse list columns from parquet into parquet",
     )?;
     module.add_function(wrap_pyfunction!(restore_parquet_to_parquet, module)?)?;
-    module.add_function(wrap_pyfunction!(restore_parquet_to_parquet_profiled, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        restore_parquet_to_parquet_profiled,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(restore_with_coord_file, module)?)?;
     module.add_function(wrap_pyfunction!(plan_restore_coords, module)?)?;
     Ok(())

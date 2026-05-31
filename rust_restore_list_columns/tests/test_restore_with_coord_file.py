@@ -3,6 +3,7 @@ from pathlib import Path
 import polars as pl
 import pyarrow as pa
 import pyarrow.ipc as ipc
+import pyarrow.parquet as pq
 
 import restore_list_columns_rs
 
@@ -19,6 +20,49 @@ def _write_coord_file(path: Path, source: Path) -> None:
     )
     with ipc.new_file(path, table.schema) as writer:
         writer.write_table(table)
+
+
+def test_restore_parquet_accepts_large_binary_json_columns(tmp_path: Path) -> None:
+    source = tmp_path / "source_large_binary.parquet"
+    lookup = tmp_path / "lookup.parquet"
+    output = tmp_path / "restored.parquet"
+
+    table = pa.table(
+        {
+            "group": pa.array(["A", "B"], type=pa.string()),
+            "value": pa.array([b"[1.5, 2.5]", b"[3.5]"], type=pa.large_binary()),
+            "coord_a": pa.array([b"[0, 0]", b"[1]"], type=pa.large_binary()),
+            "coord_b": pa.array([b"[0, 1]", b"[0]"], type=pa.large_binary()),
+        }
+    )
+    pq.write_table(table, source)
+    pl.DataFrame(
+        {
+            "group": ["A", "A", "B"],
+            "ord": [0, 1, 0],
+            "coord_a": [0, 0, 1],
+            "coord_b": [0, 1, 0],
+        }
+    ).write_parquet(lookup)
+
+    restore_list_columns_rs.restore_parquet_to_parquet(
+        str(source),
+        str(output),
+        str(lookup),
+        {"group": "TEXT", "value": "DOUBLE[]", "coord_a": "INTEGER[]", "coord_b": "INTEGER[]"},
+        {
+            "key_column": "group",
+            "order_column": "ord",
+            "value_columns": ["value"],
+            "coord_columns": ["coord_a", "coord_b"],
+        },
+        batch_size=16,
+    )
+
+    restored = pl.read_parquet(output).sort("group")
+    assert restored.get_column("value").to_list() == [[1.5, 2.5], [3.5]]
+    assert restored.get_column("coord_a").to_list() == [[0, 0], [1]]
+    assert restored.get_column("coord_b").to_list() == [[0, 1], [0]]
 
 
 def test_restore_with_coord_file_selects_only_coord_rows(tmp_path: Path) -> None:

@@ -1,6 +1,9 @@
 use arrow_array::builder::{BooleanBuilder, ListBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::types::{Float32Type, Float64Type, Int32Type};
-use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray};
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
+    RecordBatch, StringArray,
+};
 use arrow_cast::cast;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_select::filter::filter_record_batch;
@@ -170,7 +173,10 @@ fn output_dtype_for_column(
     Ok(output)
 }
 
-fn value_column_kind(schema: &HashMap<String, String>, column_name: &str) -> pyo3::PyResult<ValueColumnKind> {
+fn value_column_kind(
+    schema: &HashMap<String, String>,
+    column_name: &str,
+) -> pyo3::PyResult<ValueColumnKind> {
     let Some(raw_dtype) = schema.get(column_name) else {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "missing schema for restore value column {column_name}"
@@ -196,16 +202,18 @@ fn build_value_column_builders(
         .map(|column_name| {
             let kind = value_column_kind(schema, column_name)?;
             let builder = match kind {
-                ValueColumnKind::Float32 => {
-                    ValueColumnBuilder::Float32(ListBuilder::new(PrimitiveBuilder::<Float32Type>::new()))
+                ValueColumnKind::Float32 => ValueColumnBuilder::Float32(ListBuilder::new(
+                    PrimitiveBuilder::<Float32Type>::new(),
+                )),
+                ValueColumnKind::Float64 => ValueColumnBuilder::Float64(ListBuilder::new(
+                    PrimitiveBuilder::<Float64Type>::new(),
+                )),
+                ValueColumnKind::Integer => ValueColumnBuilder::Integer(ListBuilder::new(
+                    PrimitiveBuilder::<Int32Type>::new(),
+                )),
+                ValueColumnKind::Text => {
+                    ValueColumnBuilder::Text(ListBuilder::new(StringBuilder::new()))
                 }
-                ValueColumnKind::Float64 => {
-                    ValueColumnBuilder::Float64(ListBuilder::new(PrimitiveBuilder::<Float64Type>::new()))
-                }
-                ValueColumnKind::Integer => {
-                    ValueColumnBuilder::Integer(ListBuilder::new(PrimitiveBuilder::<Int32Type>::new()))
-                }
-                ValueColumnKind::Text => ValueColumnBuilder::Text(ListBuilder::new(StringBuilder::new())),
             };
             Ok((kind, builder))
         })
@@ -291,7 +299,11 @@ fn finish_value_column_builder(builder: ValueColumnBuilder) -> ArrayRef {
     }
 }
 
-fn batch_string_values(batch: &RecordBatch, name: &str, input_path: &str) -> pyo3::PyResult<Vec<String>> {
+fn batch_string_values(
+    batch: &RecordBatch,
+    name: &str,
+    input_path: &str,
+) -> pyo3::PyResult<Vec<String>> {
     let index = batch.schema().index_of(name).map_err(|err| {
         pyo3::exceptions::PyValueError::new_err(format!(
             "missing {name} column in {input_path}: {err}"
@@ -308,7 +320,11 @@ fn batch_string_values(batch: &RecordBatch, name: &str, input_path: &str) -> pyo
             })
             .collect());
     }
-    if let Some(values) = batch.column(index).as_any().downcast_ref::<LargeStringArray>() {
+    if let Some(values) = batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+    {
         return Ok((0..batch.num_rows())
             .map(|row_index| {
                 if values.is_null(row_index) {
@@ -319,10 +335,62 @@ fn batch_string_values(batch: &RecordBatch, name: &str, input_path: &str) -> pyo
             })
             .collect());
     }
+    if let Some(values) = batch.column(index).as_any().downcast_ref::<BinaryArray>() {
+        return binary_array_to_strings(values, name, input_path);
+    }
+    if let Some(values) = batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+    {
+        return large_binary_array_to_strings(values, name, input_path);
+    }
     Err(pyo3::exceptions::PyValueError::new_err(format!(
         "restore source column {name} must be string-like in {input_path}: {:?}",
         batch.column(index).data_type()
     )))
+}
+
+fn binary_array_to_strings(
+    values: &BinaryArray,
+    name: &str,
+    input_path: &str,
+) -> pyo3::PyResult<Vec<String>> {
+    (0..values.len())
+        .map(|row_index| {
+            if values.is_null(row_index) {
+                return Ok(String::new());
+            }
+            std::str::from_utf8(values.value(row_index))
+                .map(|value| value.to_string())
+                .map_err(|err| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "restore source column {name} contains invalid utf-8 bytes in {input_path} at row {row_index}: {err}"
+                    ))
+                })
+        })
+        .collect()
+}
+
+fn large_binary_array_to_strings(
+    values: &LargeBinaryArray,
+    name: &str,
+    input_path: &str,
+) -> pyo3::PyResult<Vec<String>> {
+    (0..values.len())
+        .map(|row_index| {
+            if values.is_null(row_index) {
+                return Ok(String::new());
+            }
+            std::str::from_utf8(values.value(row_index))
+                .map(|value| value.to_string())
+                .map_err(|err| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "restore source column {name} contains invalid utf-8 bytes in {input_path} at row {row_index}: {err}"
+                    ))
+                })
+        })
+        .collect()
 }
 
 fn batch_value_as_path_component(
@@ -383,7 +451,11 @@ fn build_output_schema(
     Ok(Arc::new(Schema::new(fields)))
 }
 
-fn cast_array_for_output(array: ArrayRef, field: &Field, context: &str) -> pyo3::PyResult<ArrayRef> {
+fn cast_array_for_output(
+    array: ArrayRef,
+    field: &Field,
+    context: &str,
+) -> pyo3::PyResult<ArrayRef> {
     if array.data_type() == field.data_type() {
         return Ok(array);
     }
@@ -395,7 +467,10 @@ fn cast_array_for_output(array: ArrayRef, field: &Field, context: &str) -> pyo3:
     })
 }
 
-fn apply_projection(batch: &RecordBatch, projection_columns: &[ProjectionColumn]) -> pyo3::PyResult<RecordBatch> {
+fn apply_projection(
+    batch: &RecordBatch,
+    projection_columns: &[ProjectionColumn],
+) -> pyo3::PyResult<RecordBatch> {
     if projection_columns.is_empty() {
         return Ok(batch.clone());
     }
@@ -419,7 +494,9 @@ fn apply_projection(batch: &RecordBatch, projection_columns: &[ProjectionColumn]
     }
     let schema = Arc::new(Schema::new(fields));
     RecordBatch::try_new(schema, columns).map_err(|err| {
-        pyo3::exceptions::PyValueError::new_err(format!("failed to build projected record batch: {err}"))
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "failed to build projected record batch: {err}"
+        ))
     })
 }
 
@@ -484,7 +561,9 @@ fn scalar_column_as_strings(
     )))
 }
 
-fn load_reference_replace_map(config: &ReferenceReplaceConfig) -> pyo3::PyResult<HashMap<String, String>> {
+fn load_reference_replace_map(
+    config: &ReferenceReplaceConfig,
+) -> pyo3::PyResult<HashMap<String, String>> {
     let file = File::open(&config.reference_parquet).map_err(|err| {
         pyo3::exceptions::PyValueError::new_err(format!(
             "failed to open reference_replace parquet {}: {err}",
@@ -538,12 +617,15 @@ fn apply_reference_replace(
     mapping: &HashMap<String, String>,
     context_path: &str,
 ) -> pyo3::PyResult<RecordBatch> {
-    let source_index = batch.schema().index_of(&config.source_column).map_err(|err| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "missing reference_replace source column {} in {context_path}: {err}",
-            config.source_column
-        ))
-    })?;
+    let source_index = batch
+        .schema()
+        .index_of(&config.source_column)
+        .map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "missing reference_replace source column {} in {context_path}: {err}",
+                config.source_column
+            ))
+        })?;
     let source_values = scalar_column_as_strings(batch, &config.source_column, context_path)?;
     let mut replacement_builder = StringBuilder::new();
     for value in source_values {
@@ -564,7 +646,11 @@ fn apply_reference_replace(
     for index in 0..batch.num_columns() {
         let field = batch_schema.field(index);
         if index == source_index {
-            fields.push(Arc::new(Field::new(&config.source_column, DataType::Utf8, true)));
+            fields.push(Arc::new(Field::new(
+                &config.source_column,
+                DataType::Utf8,
+                true,
+            )));
             columns.push(Arc::new(replacement_builder.finish()) as ArrayRef);
         } else {
             fields.push(Arc::new(field.clone()));
@@ -588,7 +674,10 @@ fn build_dense_index_cache(
     Ok(cache)
 }
 
-fn row_selection_from_offsets(row_offsets: &[usize], total_rows: usize) -> pyo3::PyResult<RowSelection> {
+fn row_selection_from_offsets(
+    row_offsets: &[usize],
+    total_rows: usize,
+) -> pyo3::PyResult<RowSelection> {
     if row_offsets.is_empty() {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "coord group must contain at least one row offset",
@@ -665,16 +754,13 @@ fn render_output_file_name(writer_config: &WriterConfig, row_group_id: Option<us
             .replace("<row_group_id>", &format!("{row_group:06}"))
             .replace("{row_group_id}", &format!("{row_group:06}"));
     }
-    writer_config
-        .output_file_name
-        .clone()
-        .unwrap_or_else(|| {
-            let prefix = writer_config
-                .file_name_prefix
-                .clone()
-                .unwrap_or_else(|| "part".to_string());
-            format!("{prefix}-00000.parquet")
-        })
+    writer_config.output_file_name.clone().unwrap_or_else(|| {
+        let prefix = writer_config
+            .file_name_prefix
+            .clone()
+            .unwrap_or_else(|| "part".to_string());
+        format!("{prefix}-00000.parquet")
+    })
 }
 
 fn write_partitioned_batch(
@@ -709,7 +795,9 @@ fn write_partitioned_batch(
         }
         let mask = builder.finish();
         let filtered = filter_record_batch(batch, &mask).map_err(|err| {
-            pyo3::exceptions::PyValueError::new_err(format!("failed to filter partition batch: {err}"))
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to filter partition batch: {err}"
+            ))
         })?;
         if filtered.num_rows() == 0 {
             continue;
@@ -795,13 +883,17 @@ fn restore_batch_columns(
             pyo3::exceptions::PyValueError::new_err(format!("unknown lookup key '{group_key}'"))
         })?;
         let dense_index = dense_index_cache.get(group_key).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!("missing dense index for lookup key '{group_key}'"))
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "missing dense index for lookup key '{group_key}'"
+            ))
         })?;
 
         let coord_a_sparse = parse_json_i32_array(&coord_a_sparse_json[row_index])?;
         let coord_b_sparse = parse_json_i32_array(&coord_b_sparse_json[row_index])?;
 
-        for ((kind, builder), value_sparse_json) in value_builders.iter_mut().zip(value_sparse_jsons.iter()) {
+        for ((kind, builder), value_sparse_json) in
+            value_builders.iter_mut().zip(value_sparse_jsons.iter())
+        {
             match kind {
                 ValueColumnKind::Float32 => {
                     let value_sparse = parse_json_f64_array(&value_sparse_json[row_index])?;
@@ -874,7 +966,11 @@ fn restore_batch_columns(
         .value_columns
         .iter()
         .cloned()
-        .zip(value_builders.into_iter().map(|(_, builder)| finish_value_column_builder(builder)))
+        .zip(
+            value_builders
+                .into_iter()
+                .map(|(_, builder)| finish_value_column_builder(builder)),
+        )
         .collect();
 
     let mut output_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
@@ -994,11 +1090,12 @@ fn restore_parquet_to_parquet_internal(
             "failed to create output parquet {output_parquet_path}: {err}"
         ))
     })?;
-    let mut writer = ArrowWriter::try_new(output_file, output_schema.clone(), None).map_err(|err| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "failed to initialize parquet writer {output_parquet_path}: {err}"
-        ))
-    })?;
+    let mut writer =
+        ArrowWriter::try_new(output_file, output_schema.clone(), None).map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to initialize parquet writer {output_parquet_path}: {err}"
+            ))
+        })?;
 
     let restore_started = Instant::now();
     let mut rows_written = 0usize;
@@ -1017,7 +1114,11 @@ fn restore_parquet_to_parquet_internal(
             &refs,
             &dense_index_cache,
             output_schema.clone(),
-            if detailed { Some(&mut detailed_profile) } else { None },
+            if detailed {
+                Some(&mut detailed_profile)
+            } else {
+                None
+            },
         )?;
         rows_written += restored.num_rows();
         if detailed {
@@ -1087,10 +1188,19 @@ fn restore_parquet_to_parquet_internal(
     stats.insert("write_elapsed_sec".to_string(), parquet_write_sec);
     stats.insert("total_sec".to_string(), total_sec);
     if detailed {
-        stats.insert("batches_processed".to_string(), detailed_profile.batches_processed as f64);
+        stats.insert(
+            "batches_processed".to_string(),
+            detailed_profile.batches_processed as f64,
+        );
         stats.insert("input_rows".to_string(), detailed_profile.input_rows as f64);
-        stats.insert("max_batch_rows".to_string(), detailed_profile.max_batch_rows as f64);
-        stats.insert("max_dense_len".to_string(), detailed_profile.max_dense_len as f64);
+        stats.insert(
+            "max_batch_rows".to_string(),
+            detailed_profile.max_batch_rows as f64,
+        );
+        stats.insert(
+            "max_dense_len".to_string(),
+            detailed_profile.max_dense_len as f64,
+        );
         stats.insert(
             "max_restored_batch_array_bytes".to_string(),
             detailed_profile.max_restored_batch_array_bytes as f64,
@@ -1104,13 +1214,34 @@ fn restore_parquet_to_parquet_internal(
                     / detailed_profile.batches_processed as f64
             },
         );
-        stats.insert("value_column_count".to_string(), config.value_columns.len() as f64);
-        stats.insert("source_extract_sec".to_string(), detailed_profile.source_extract_sec);
-        stats.insert("dense_restore_sec".to_string(), detailed_profile.dense_restore_sec);
-        stats.insert("record_batch_build_sec".to_string(), detailed_profile.record_batch_build_sec);
-        stats.insert("writer_write_sec".to_string(), detailed_profile.writer_write_sec);
-        stats.insert("cache_hint_sec".to_string(), detailed_profile.cache_hint_sec);
-        stats.insert("cache_hint_calls".to_string(), detailed_profile.cache_hint_calls as f64);
+        stats.insert(
+            "value_column_count".to_string(),
+            config.value_columns.len() as f64,
+        );
+        stats.insert(
+            "source_extract_sec".to_string(),
+            detailed_profile.source_extract_sec,
+        );
+        stats.insert(
+            "dense_restore_sec".to_string(),
+            detailed_profile.dense_restore_sec,
+        );
+        stats.insert(
+            "record_batch_build_sec".to_string(),
+            detailed_profile.record_batch_build_sec,
+        );
+        stats.insert(
+            "writer_write_sec".to_string(),
+            detailed_profile.writer_write_sec,
+        );
+        stats.insert(
+            "cache_hint_sec".to_string(),
+            detailed_profile.cache_hint_sec,
+        );
+        stats.insert(
+            "cache_hint_calls".to_string(),
+            detailed_profile.cache_hint_calls as f64,
+        );
         if let Ok(metadata) = std::fs::metadata(&output_parquet_path) {
             stats.insert("output_file_size_bytes".to_string(), metadata.len() as f64);
         }
@@ -1183,9 +1314,11 @@ pub fn restore_with_coord_file_impl(
     let total_started = Instant::now();
     let config = parse_config(&config_json)?;
     let writer_config = match writer_config_json {
-        Some(raw) if !raw.trim().is_empty() => serde_json::from_str::<WriterConfig>(&raw).map_err(|err| {
-            pyo3::exceptions::PyValueError::new_err(format!("invalid writer config: {err}"))
-        })?,
+        Some(raw) if !raw.trim().is_empty() => {
+            serde_json::from_str::<WriterConfig>(&raw).map_err(|err| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid writer config: {err}"))
+            })?
+        }
         _ => WriterConfig {
             output_file_name: None,
             file_name_rule: None,
@@ -1369,7 +1502,10 @@ pub fn restore_with_coord_file_impl(
     let mut stats = HashMap::new();
     stats.insert("rows_written".to_string(), rows_written as f64);
     stats.insert("selected_row_count".to_string(), rows_written as f64);
-    stats.insert("source_file_count".to_string(), source_files_seen.len() as f64);
+    stats.insert(
+        "source_file_count".to_string(),
+        source_files_seen.len() as f64,
+    );
     stats.insert("row_group_count".to_string(), row_group_count as f64);
     stats.insert("output_file_count".to_string(), output_paths.len() as f64);
     let output_partition_count = if writer_config.partition_columns.is_empty() {
@@ -1377,7 +1513,11 @@ pub fn restore_with_coord_file_impl(
     } else {
         output_paths
             .iter()
-            .filter_map(|path| std::path::Path::new(path).parent().map(|parent| parent.to_path_buf()))
+            .filter_map(|path| {
+                std::path::Path::new(path)
+                    .parent()
+                    .map(|parent| parent.to_path_buf())
+            })
             .collect::<HashSet<_>>()
             .len()
     };
@@ -1385,7 +1525,10 @@ pub fn restore_with_coord_file_impl(
         "output_partition_count".to_string(),
         output_partition_count as f64,
     );
-    stats.insert("output_file_write_touches".to_string(), output_file_write_touches as f64);
+    stats.insert(
+        "output_file_write_touches".to_string(),
+        output_file_write_touches as f64,
+    );
     stats.insert("coord_groups".to_string(), coord_groups.len() as f64);
     stats.insert("coord_read_sec".to_string(), coord_read_sec);
     stats.insert("reference_load_sec".to_string(), reference_load_sec);
@@ -1394,10 +1537,19 @@ pub fn restore_with_coord_file_impl(
     stats.insert("restore_elapsed_sec".to_string(), restore_sec);
     stats.insert("write_elapsed_sec".to_string(), parquet_write_sec);
     stats.insert("total_sec".to_string(), total_sec);
-    stats.insert("batches_processed".to_string(), detailed_profile.batches_processed as f64);
+    stats.insert(
+        "batches_processed".to_string(),
+        detailed_profile.batches_processed as f64,
+    );
     stats.insert("input_rows".to_string(), detailed_profile.input_rows as f64);
-    stats.insert("max_batch_rows".to_string(), detailed_profile.max_batch_rows as f64);
-    stats.insert("max_dense_len".to_string(), detailed_profile.max_dense_len as f64);
+    stats.insert(
+        "max_batch_rows".to_string(),
+        detailed_profile.max_batch_rows as f64,
+    );
+    stats.insert(
+        "max_dense_len".to_string(),
+        detailed_profile.max_dense_len as f64,
+    );
     stats.insert(
         "max_restored_batch_array_bytes".to_string(),
         detailed_profile.max_restored_batch_array_bytes as f64,
@@ -1411,12 +1563,30 @@ pub fn restore_with_coord_file_impl(
                 / detailed_profile.batches_processed as f64
         },
     );
-    stats.insert("value_column_count".to_string(), config.value_columns.len() as f64);
-    stats.insert("source_extract_sec".to_string(), detailed_profile.source_extract_sec);
-    stats.insert("dense_restore_sec".to_string(), detailed_profile.dense_restore_sec);
-    stats.insert("record_batch_build_sec".to_string(), detailed_profile.record_batch_build_sec);
-    stats.insert("writer_write_sec".to_string(), detailed_profile.writer_write_sec);
-    stats.insert("cache_hint_calls".to_string(), detailed_profile.cache_hint_calls as f64);
+    stats.insert(
+        "value_column_count".to_string(),
+        config.value_columns.len() as f64,
+    );
+    stats.insert(
+        "source_extract_sec".to_string(),
+        detailed_profile.source_extract_sec,
+    );
+    stats.insert(
+        "dense_restore_sec".to_string(),
+        detailed_profile.dense_restore_sec,
+    );
+    stats.insert(
+        "record_batch_build_sec".to_string(),
+        detailed_profile.record_batch_build_sec,
+    );
+    stats.insert(
+        "writer_write_sec".to_string(),
+        detailed_profile.writer_write_sec,
+    );
+    stats.insert(
+        "cache_hint_calls".to_string(),
+        detailed_profile.cache_hint_calls as f64,
+    );
     let output_total_size_bytes: u64 = output_paths
         .iter()
         .filter_map(|path| std::fs::metadata(path).ok().map(|metadata| metadata.len()))

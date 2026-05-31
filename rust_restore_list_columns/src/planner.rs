@@ -1,4 +1,6 @@
-use arrow_array::{Array, Float64Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray};
+use arrow_array::{
+    Array, Float64Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+};
 use arrow_ipc::writer::FileWriter;
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -103,16 +105,25 @@ impl CoordBuffers {
         planner_chunk_id: usize,
     ) -> pyo3::PyResult<()> {
         self.source_file.push(source_file.to_string());
-        self.row_group_id.push(i32::try_from(row_group_id).map_err(|err| {
-            pyo3::exceptions::PyValueError::new_err(format!("row_group_id conversion failed: {err}"))
-        })?);
+        self.row_group_id
+            .push(i32::try_from(row_group_id).map_err(|err| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "row_group_id conversion failed: {err}"
+                ))
+            })?);
         self.row_index.push(row_index);
-        self.row_offset_in_group.push(i32::try_from(row_offset_in_group).map_err(|err| {
-            pyo3::exceptions::PyValueError::new_err(format!("row_offset_in_group conversion failed: {err}"))
-        })?);
-        self.planner_chunk_id.push(i32::try_from(planner_chunk_id).map_err(|err| {
-            pyo3::exceptions::PyValueError::new_err(format!("planner_chunk_id conversion failed: {err}"))
-        })?);
+        self.row_offset_in_group
+            .push(i32::try_from(row_offset_in_group).map_err(|err| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "row_offset_in_group conversion failed: {err}"
+                ))
+            })?);
+        self.planner_chunk_id
+            .push(i32::try_from(planner_chunk_id).map_err(|err| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "planner_chunk_id conversion failed: {err}"
+                ))
+            })?);
         Ok(())
     }
 }
@@ -176,7 +187,9 @@ fn write_coord_chunk(
             path.display()
         ))
     })?;
-    Ok(std::fs::metadata(&path).map(|metadata| metadata.len()).unwrap_or(0))
+    Ok(std::fs::metadata(&path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0))
 }
 
 fn required_filter_columns(filter_config: &FilterConfig) -> Vec<String> {
@@ -202,7 +215,11 @@ fn required_filter_columns(filter_config: &FilterConfig) -> Vec<String> {
     columns
 }
 
-fn collect_filter_columns(filter: &ThinFilter, seen: &mut HashSet<String>, columns: &mut Vec<String>) {
+fn collect_filter_columns(
+    filter: &ThinFilter,
+    seen: &mut HashSet<String>,
+    columns: &mut Vec<String>,
+) {
     if !filter.column.is_empty() && seen.insert(filter.column.clone()) {
         columns.push(filter.column.clone());
     }
@@ -211,9 +228,15 @@ fn collect_filter_columns(filter: &ThinFilter, seen: &mut HashSet<String>, colum
     }
 }
 
-fn scalar_value(batch: &RecordBatch, column_name: &str, row_index: usize) -> pyo3::PyResult<ScalarValue> {
+fn scalar_value(
+    batch: &RecordBatch,
+    column_name: &str,
+    row_index: usize,
+) -> pyo3::PyResult<ScalarValue> {
     let index = batch.schema().index_of(column_name).map_err(|err| {
-        pyo3::exceptions::PyValueError::new_err(format!("missing planner column {column_name}: {err}"))
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "missing planner column {column_name}: {err}"
+        ))
     })?;
     let column = batch.column(index);
     if column.is_null(row_index) {
@@ -255,21 +278,35 @@ fn scalar_cmp(left: &ScalarValue, right: &ScalarValue) -> Ordering {
         (ScalarValue::Null, _) => Ordering::Less,
         (_, ScalarValue::Null) => Ordering::Greater,
         (ScalarValue::Int(a), ScalarValue::Int(b)) => a.cmp(b),
-        (ScalarValue::Float(a), ScalarValue::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-        (ScalarValue::Int(a), ScalarValue::Float(b)) => (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal),
-        (ScalarValue::Float(a), ScalarValue::Int(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal),
+        (ScalarValue::Float(a), ScalarValue::Float(b)) => {
+            a.partial_cmp(b).unwrap_or(Ordering::Equal)
+        }
+        (ScalarValue::Int(a), ScalarValue::Float(b)) => {
+            (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)
+        }
+        (ScalarValue::Float(a), ScalarValue::Int(b)) => {
+            a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)
+        }
         _ => scalar_to_string(left).cmp(&scalar_to_string(right)),
     }
 }
 
 fn filter_matches(row: &CandidateRow, filters: &[ThinFilter]) -> bool {
-    filters.iter().all(|filter| thin_filter_matches(row, filter))
+    filters
+        .iter()
+        .all(|filter| thin_filter_matches(row, filter))
 }
 
 fn thin_filter_matches(row: &CandidateRow, filter: &ThinFilter) -> bool {
     match filter.op.to_ascii_lowercase().as_str() {
-        "and" => filter.filters.iter().all(|child| thin_filter_matches(row, child)),
-        "or" => filter.filters.iter().any(|child| thin_filter_matches(row, child)),
+        "and" => filter
+            .filters
+            .iter()
+            .all(|child| thin_filter_matches(row, child)),
+        "or" => filter
+            .filters
+            .iter()
+            .any(|child| thin_filter_matches(row, child)),
         "is_not_null" => {
             let value = row.values.get(&filter.column).unwrap_or(&ScalarValue::Null);
             !matches!(value, ScalarValue::Null)
@@ -314,14 +351,11 @@ fn like_matches(value: &str, pattern: &str) -> bool {
         }
         match pattern[0] {
             '%' => {
-                inner(value, &pattern[1..])
-                    || (!value.is_empty() && inner(&value[1..], pattern))
+                inner(value, &pattern[1..]) || (!value.is_empty() && inner(&value[1..], pattern))
             }
             '_' => !value.is_empty() && inner(&value[1..], &pattern[1..]),
             expected => {
-                !value.is_empty()
-                    && value[0] == expected
-                    && inner(&value[1..], &pattern[1..])
+                !value.is_empty() && value[0] == expected && inner(&value[1..], &pattern[1..])
             }
         }
     }
@@ -362,7 +396,10 @@ fn apply_dedupe(rows: Vec<CandidateRow>, dedupe: Option<&DedupeConfig>) -> Vec<C
         let key = dedupe
             .group_keys
             .iter()
-            .map(|column| scalar_to_string(row.values.get(column).unwrap_or(&ScalarValue::Null)).unwrap_or_default())
+            .map(|column| {
+                scalar_to_string(row.values.get(column).unwrap_or(&ScalarValue::Null))
+                    .unwrap_or_default()
+            })
             .collect::<Vec<_>>()
             .join("\u{1f}");
         if seen.insert(key) {
@@ -421,7 +458,8 @@ fn collect_candidate_rows(
     }
 
     let schema_descr = base_builder.metadata().file_metadata().schema_descr_ptr();
-    let projection = ProjectionMask::columns(&schema_descr, required_columns.iter().map(String::as_str));
+    let projection =
+        ProjectionMask::columns(&schema_descr, required_columns.iter().map(String::as_str));
     let mut rows = Vec::new();
     let mut file_row_base = 0i64;
     let mut ordinal = 0usize;
@@ -496,15 +534,18 @@ pub fn plan_restore_coords_impl(
 ) -> pyo3::PyResult<HashMap<String, f64>> {
     let started = Instant::now();
     let filter_config = match filter_config_json {
-        Some(raw) if !raw.trim().is_empty() => serde_json::from_str::<FilterConfig>(&raw).map_err(|err| {
-            pyo3::exceptions::PyValueError::new_err(format!("invalid filter config: {err}"))
-        })?,
+        Some(raw) if !raw.trim().is_empty() => {
+            serde_json::from_str::<FilterConfig>(&raw).map_err(|err| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid filter config: {err}"))
+            })?
+        }
         _ => FilterConfig::default(),
     };
     let planner_config = match planner_config_json {
-        Some(raw) if !raw.trim().is_empty() => serde_json::from_str::<PlannerConfig>(&raw).map_err(|err| {
-            pyo3::exceptions::PyValueError::new_err(format!("invalid planner config: {err}"))
-        })?,
+        Some(raw) if !raw.trim().is_empty() => serde_json::from_str::<PlannerConfig>(&raw)
+            .map_err(|err| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid planner config: {err}"))
+            })?,
         _ => PlannerConfig { row_count: None },
     };
     let row_count = planner_config.row_count.unwrap_or(10_000).max(1);
@@ -517,20 +558,14 @@ pub fn plan_restore_coords_impl(
     let required_columns = required_filter_columns(&filter_config);
 
     for source_file in &input_parquet_paths {
-        let (candidate_rows, row_group_count) = collect_candidate_rows(
-            source_file,
-            &filter_config,
-            &required_columns,
-        )?;
+        let (candidate_rows, row_group_count) =
+            collect_candidate_rows(source_file, &filter_config, &required_columns)?;
         input_row_group_count += row_group_count;
         let selected_rows = apply_dedupe(candidate_rows, filter_config.dedupe.as_ref());
         for row in selected_rows {
             if buffers.len() >= row_count {
-                coord_total_size_bytes += write_coord_chunk(
-                    &coord_output_dir,
-                    coord_chunk_count,
-                    buffers,
-                )?;
+                coord_total_size_bytes +=
+                    write_coord_chunk(&coord_output_dir, coord_chunk_count, buffers)?;
                 coord_chunk_count += 1;
                 buffers = CoordBuffers::new();
             }
@@ -550,13 +585,28 @@ pub fn plan_restore_coords_impl(
     }
 
     let mut stats = HashMap::new();
-    stats.insert("input_file_count".to_string(), input_parquet_paths.len() as f64);
-    stats.insert("input_row_group_count".to_string(), input_row_group_count as f64);
-    stats.insert("scanned_row_group_count".to_string(), input_row_group_count as f64);
+    stats.insert(
+        "input_file_count".to_string(),
+        input_parquet_paths.len() as f64,
+    );
+    stats.insert(
+        "input_row_group_count".to_string(),
+        input_row_group_count as f64,
+    );
+    stats.insert(
+        "scanned_row_group_count".to_string(),
+        input_row_group_count as f64,
+    );
     stats.insert("skipped_row_group_count".to_string(), 0.0);
     stats.insert("selected_row_count".to_string(), selected_row_count as f64);
     stats.insert("coord_chunk_count".to_string(), coord_chunk_count as f64);
-    stats.insert("coord_total_size_bytes".to_string(), coord_total_size_bytes as f64);
-    stats.insert("planner_elapsed_sec".to_string(), started.elapsed().as_secs_f64());
+    stats.insert(
+        "coord_total_size_bytes".to_string(),
+        coord_total_size_bytes as f64,
+    );
+    stats.insert(
+        "planner_elapsed_sec".to_string(),
+        started.elapsed().as_secs_f64(),
+    );
     Ok(stats)
 }

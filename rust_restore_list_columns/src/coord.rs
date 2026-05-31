@@ -18,8 +18,17 @@ fn column_index(batch: &RecordBatch, name: &str, coord_path: &str) -> pyo3::PyRe
     })
 }
 
-fn string_value(batch: &RecordBatch, column_index: usize, row_index: usize, coord_path: &str) -> pyo3::PyResult<String> {
-    if let Some(values) = batch.column(column_index).as_any().downcast_ref::<StringArray>() {
+fn string_value(
+    batch: &RecordBatch,
+    column_index: usize,
+    row_index: usize,
+    coord_path: &str,
+) -> pyo3::PyResult<String> {
+    if let Some(values) = batch
+        .column(column_index)
+        .as_any()
+        .downcast_ref::<StringArray>()
+    {
         if values.is_null(row_index) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "coord source_file cannot be null in {coord_path} at row {row_index}"
@@ -27,7 +36,11 @@ fn string_value(batch: &RecordBatch, column_index: usize, row_index: usize, coor
         }
         return Ok(values.value(row_index).to_string());
     }
-    if let Some(values) = batch.column(column_index).as_any().downcast_ref::<LargeStringArray>() {
+    if let Some(values) = batch
+        .column(column_index)
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+    {
         if values.is_null(row_index) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "coord source_file cannot be null in {coord_path} at row {row_index}"
@@ -40,8 +53,18 @@ fn string_value(batch: &RecordBatch, column_index: usize, row_index: usize, coor
     )))
 }
 
-fn integer_value(batch: &RecordBatch, column_index: usize, row_index: usize, coord_path: &str, name: &str) -> pyo3::PyResult<i64> {
-    if let Some(values) = batch.column(column_index).as_any().downcast_ref::<Int32Array>() {
+fn integer_value(
+    batch: &RecordBatch,
+    column_index: usize,
+    row_index: usize,
+    coord_path: &str,
+    name: &str,
+) -> pyo3::PyResult<i64> {
+    if let Some(values) = batch
+        .column(column_index)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+    {
         if values.is_null(row_index) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "coord {name} cannot be null in {coord_path} at row {row_index}"
@@ -49,7 +72,11 @@ fn integer_value(batch: &RecordBatch, column_index: usize, row_index: usize, coo
         }
         return Ok(values.value(row_index) as i64);
     }
-    if let Some(values) = batch.column(column_index).as_any().downcast_ref::<Int64Array>() {
+    if let Some(values) = batch
+        .column(column_index)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+    {
         if values.is_null(row_index) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "coord {name} cannot be null in {coord_path} at row {row_index}"
@@ -64,24 +91,37 @@ fn integer_value(batch: &RecordBatch, column_index: usize, row_index: usize, coo
 
 pub fn read_coord_groups(coord_path: &str) -> pyo3::PyResult<Vec<CoordGroup>> {
     let file = File::open(coord_path).map_err(|err| {
-        pyo3::exceptions::PyValueError::new_err(format!("failed to open coord file {coord_path}: {err}"))
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "failed to open coord file {coord_path}: {err}"
+        ))
     })?;
     let reader = FileReader::try_new(file, None).map_err(|err| {
-        pyo3::exceptions::PyValueError::new_err(format!("failed to initialize coord IPC reader {coord_path}: {err}"))
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "failed to initialize coord IPC reader {coord_path}: {err}"
+        ))
     })?;
 
     let mut grouped: BTreeMap<(String, usize), Vec<usize>> = BTreeMap::new();
     for batch_result in reader {
         let batch = batch_result.map_err(|err| {
-            pyo3::exceptions::PyValueError::new_err(format!("failed to read coord batch {coord_path}: {err}"))
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to read coord batch {coord_path}: {err}"
+            ))
         })?;
         let source_file_idx = column_index(&batch, "source_file", coord_path)?;
         let row_group_idx = column_index(&batch, "row_group_id", coord_path)?;
         let row_offset_idx = column_index(&batch, "row_offset_in_group", coord_path)?;
         for row_index in 0..batch.num_rows() {
             let source_file = string_value(&batch, source_file_idx, row_index, coord_path)?;
-            let row_group_id = integer_value(&batch, row_group_idx, row_index, coord_path, "row_group_id")?;
-            let row_offset = integer_value(&batch, row_offset_idx, row_index, coord_path, "row_offset_in_group")?;
+            let row_group_id =
+                integer_value(&batch, row_group_idx, row_index, coord_path, "row_group_id")?;
+            let row_offset = integer_value(
+                &batch,
+                row_offset_idx,
+                row_index,
+                coord_path,
+                "row_offset_in_group",
+            )?;
             if row_group_id < 0 || row_offset < 0 {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "coord row_group_id and row_offset_in_group must be non-negative in {coord_path}"

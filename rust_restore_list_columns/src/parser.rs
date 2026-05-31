@@ -102,7 +102,9 @@ fn parse_f64_token(raw: &str) -> pyo3::PyResult<f64> {
 
 fn parse_string_token(bytes: &[u8], start: usize, end: usize) -> pyo3::PyResult<String> {
     let raw = std::str::from_utf8(&bytes[start..end]).map_err(|err| {
-        pyo3::exceptions::PyValueError::new_err(format!("invalid utf-8 in JSON string token: {err}"))
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid utf-8 in JSON string token: {err}"
+        ))
     })?;
     decode_json_string(raw, "string")
 }
@@ -118,9 +120,9 @@ where
     let normalized = normalize_array_input(raw, kind)?;
     let bytes = normalized.as_bytes();
     if bytes.len() < 2 || bytes[0] != b'[' || bytes[bytes.len() - 1] != b']' {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            format!("expected JSON array for {kind} list"),
-        ));
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "expected JSON array for {kind} list"
+        )));
     }
 
     let mut result = Vec::new();
@@ -160,9 +162,11 @@ fn parse_i32_token_from_bytes(bytes: &[u8], start: usize, end: usize) -> pyo3::P
     let raw_token = if bytes[start] == b'"' {
         parse_string_token(bytes, start, end)?
     } else {
-        std::str::from_utf8(&bytes[start..end]).map_err(|err| {
-            pyo3::exceptions::PyValueError::new_err(format!("invalid utf-8 in int list: {err}"))
-        })?.to_string()
+        std::str::from_utf8(&bytes[start..end])
+            .map_err(|err| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid utf-8 in int list: {err}"))
+            })?
+            .to_string()
     };
     parse_i32_token(&raw_token)
 }
@@ -170,16 +174,18 @@ fn parse_i32_token_from_bytes(bytes: &[u8], start: usize, end: usize) -> pyo3::P
 fn parse_f64_token_from_bytes(bytes: &[u8], start: usize, end: usize) -> pyo3::PyResult<f64> {
     let (start, end) = trim_ascii_ws(bytes, start, end);
     if start >= end {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "empty float token",
-        ));
+        return Err(pyo3::exceptions::PyValueError::new_err("empty float token"));
     }
     let raw_token = if bytes[start] == b'"' {
         parse_string_token(bytes, start, end)?
     } else {
-        std::str::from_utf8(&bytes[start..end]).map_err(|err| {
-            pyo3::exceptions::PyValueError::new_err(format!("invalid utf-8 in float list: {err}"))
-        })?.to_string()
+        std::str::from_utf8(&bytes[start..end])
+            .map_err(|err| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "invalid utf-8 in float list: {err}"
+                ))
+            })?
+            .to_string()
     };
     parse_f64_token(&raw_token)
 }

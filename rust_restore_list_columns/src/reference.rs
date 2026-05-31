@@ -24,7 +24,11 @@ fn batch_string_values(
             .map(|row_index| values.value(row_index).to_string())
             .collect());
     }
-    if let Some(values) = batch.column(index).as_any().downcast_ref::<LargeStringArray>() {
+    if let Some(values) = batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+    {
         return Ok((0..batch.num_rows())
             .map(|row_index| values.value(row_index).to_string())
             .collect());
@@ -157,7 +161,9 @@ pub fn build_dense_index(
         )));
     }
     let mut index = HashMap::with_capacity(dense_coord_a.len());
-    for (position, (&coord_a, &coord_b)) in dense_coord_a.iter().zip(dense_coord_b.iter()).enumerate() {
+    for (position, (&coord_a, &coord_b)) in
+        dense_coord_a.iter().zip(dense_coord_b.iter()).enumerate()
+    {
         index.insert((coord_a, coord_b), position);
     }
     Ok(index)
