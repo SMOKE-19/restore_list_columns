@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -76,6 +77,12 @@ enum ValueColumnBuilder {
     Float64(ListBuilder<PrimitiveBuilder<Float64Type>>),
     Integer(ListBuilder<PrimitiveBuilder<Int32Type>>),
     Text(ListBuilder<StringBuilder>),
+}
+
+struct ManagedParquetWriter {
+    writer: ArrowWriter<File>,
+    final_path: PathBuf,
+    temp_path: PathBuf,
 }
 
 #[derive(Default)]
@@ -764,7 +771,7 @@ fn render_output_file_name(writer_config: &WriterConfig, row_group_id: Option<us
 }
 
 fn write_partitioned_batch(
-    writers: &mut HashMap<String, ArrowWriter<File>>,
+    writers: &mut HashMap<String, ManagedParquetWriter>,
     output_dir: &str,
     writer_config: &WriterConfig,
     output_schema: Arc<Schema>,
@@ -810,8 +817,8 @@ fn write_partitioned_batch(
 }
 
 fn write_batch_to_path(
-    writers: &mut HashMap<String, ArrowWriter<File>>,
-    output_path: std::path::PathBuf,
+    writers: &mut HashMap<String, ManagedParquetWriter>,
+    output_path: PathBuf,
     output_schema: Arc<Schema>,
     batch: &RecordBatch,
 ) -> pyo3::PyResult<()> {
@@ -825,23 +832,33 @@ fn write_batch_to_path(
     }
     let key = output_path.to_string_lossy().to_string();
     if !writers.contains_key(&key) {
-        let output_file = File::create(&output_path).map_err(|err| {
+        let temp_path = temp_output_path(&output_path);
+        let output_file = File::create(&temp_path).map_err(|err| {
             pyo3::exceptions::PyValueError::new_err(format!(
-                "failed to create output parquet {}: {err}",
-                output_path.display()
+                "failed to create temp output parquet {}: {err}",
+                temp_path.display()
             ))
         })?;
         let writer = ArrowWriter::try_new(output_file, output_schema, None).map_err(|err| {
+            let _ = std::fs::remove_file(&temp_path);
             pyo3::exceptions::PyValueError::new_err(format!(
                 "failed to initialize parquet writer {}: {err}",
-                output_path.display()
+                temp_path.display()
             ))
         })?;
-        writers.insert(key.clone(), writer);
+        writers.insert(
+            key.clone(),
+            ManagedParquetWriter {
+                writer,
+                final_path: output_path.clone(),
+                temp_path,
+            },
+        );
     }
     writers
         .get_mut(&key)
         .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("missing partition writer"))?
+        .writer
         .write(batch)
         .map_err(|err| {
             pyo3::exceptions::PyValueError::new_err(format!(
@@ -849,6 +866,14 @@ fn write_batch_to_path(
                 output_path.display()
             ))
         })
+}
+
+fn temp_output_path(output_path: &std::path::Path) -> PathBuf {
+    let file_name = output_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("part.parquet");
+    output_path.with_file_name(format!(".{file_name}.tmp"))
 }
 
 fn restore_batch_columns(
@@ -1359,7 +1384,7 @@ pub fn restore_with_coord_file_impl(
             "failed to create output dir {output_dir}: {err}"
         ))
     })?;
-    let mut writers: HashMap<String, ArrowWriter<File>> = HashMap::new();
+    let mut writers: HashMap<String, ManagedParquetWriter> = HashMap::new();
     let mut output_schema: Option<Arc<Schema>> = None;
     let mut rows_written = 0usize;
     let mut source_files_seen: HashSet<String> = HashSet::new();
@@ -1480,13 +1505,30 @@ pub fn restore_with_coord_file_impl(
             "coord restore produced no output writers",
         ));
     }
-    let output_paths: Vec<String> = writers.keys().cloned().collect();
-    for (path, writer) in writers {
-        writer.close().map_err(|err| {
+    let mut output_paths: Vec<String> = Vec::new();
+    for (_path, managed) in writers {
+        managed.writer.close().map_err(|err| {
             pyo3::exceptions::PyValueError::new_err(format!(
-                "failed to finalize output parquet {path}: {err}"
+                "failed to finalize output parquet {}: {err}",
+                managed.temp_path.display()
             ))
         })?;
+        if managed.final_path.exists() {
+            std::fs::remove_file(&managed.final_path).map_err(|err| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "failed to replace existing output parquet {}: {err}",
+                    managed.final_path.display()
+                ))
+            })?;
+        }
+        std::fs::rename(&managed.temp_path, &managed.final_path).map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to publish output parquet {} -> {}: {err}",
+                managed.temp_path.display(),
+                managed.final_path.display()
+            ))
+        })?;
+        output_paths.push(managed.final_path.to_string_lossy().to_string());
     }
     let parquet_write_sec = write_started.elapsed().as_secs_f64();
     if drop_cache_hint {

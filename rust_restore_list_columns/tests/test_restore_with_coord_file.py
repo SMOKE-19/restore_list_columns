@@ -224,6 +224,64 @@ def test_restore_with_coord_file_applies_reference_replace(tmp_path: Path) -> No
     assert restored.get_column("status").to_list() == ["new", "keep"]
 
 
+def test_restore_with_coord_file_does_not_publish_partial_parquet_on_error(tmp_path: Path) -> None:
+    source = tmp_path / "source.parquet"
+    lookup = tmp_path / "lookup.parquet"
+    coord = tmp_path / "coord.arrow"
+    output_dir = tmp_path / "out"
+
+    pl.DataFrame(
+        {
+            "id": ["r0", "r1"],
+            "group": ["A", "B"],
+            "value": ["[1.5]", "[2.5]"],
+            "coord_a": ["[0]", "[0]"],
+            "coord_b": ["[0]", "[0]"],
+        }
+    ).write_parquet(source, row_group_size=1)
+    pl.DataFrame(
+        {
+            "group": ["A"],
+            "ord": [0],
+            "coord_a": [0],
+            "coord_b": [0],
+        }
+    ).write_parquet(lookup)
+    table = pa.table(
+        {
+            "source_file": [str(source), str(source)],
+            "row_group_id": pa.array([0, 1], type=pa.int32()),
+            "row_index": pa.array([0, 1], type=pa.int64()),
+            "row_offset_in_group": pa.array([0, 0], type=pa.int32()),
+            "planner_chunk_id": pa.array([0, 0], type=pa.int32()),
+        }
+    )
+    with ipc.new_file(coord, table.schema) as writer:
+        writer.write_table(table)
+
+    try:
+        restore_list_columns_rs.restore_with_coord_file(
+            str(coord),
+            str(output_dir),
+            str(lookup),
+            {"value": "DOUBLE[]", "coord_a": "INTEGER[]", "coord_b": "INTEGER[]"},
+            {
+                "key_column": "group",
+                "order_column": "ord",
+                "value_columns": ["value"],
+                "coord_columns": ["coord_a", "coord_b"],
+            },
+            {"output_file_name": "part-test.parquet"},
+        )
+    except ValueError as exc:
+        assert "unknown lookup key" in str(exc)
+    else:
+        raise AssertionError("restore_with_coord_file should fail on missing lookup key")
+
+    assert not list(output_dir.rglob("*.parquet"))
+    assert all(path.stat().st_size > 0 for path in output_dir.rglob("*") if path.is_file())
+
+
 def test_plan_restore_coords_writes_row_count_chunks(tmp_path: Path) -> None:
     source = tmp_path / "source.parquet"
     coord_dir = tmp_path / "coords"
