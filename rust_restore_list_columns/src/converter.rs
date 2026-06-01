@@ -16,9 +16,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::coord::read_coord_groups;
 use crate::parser::{parse_json_f64_array, parse_json_i32_array, parse_json_string_array};
@@ -84,6 +84,8 @@ struct ManagedParquetWriter {
     final_path: PathBuf,
     temp_path: PathBuf,
 }
+
+const FILE_OP_RETRY_ATTEMPTS: usize = 8;
 
 #[derive(Default)]
 struct DetailedProfile {
@@ -876,6 +878,37 @@ fn temp_output_path(output_path: &std::path::Path) -> PathBuf {
     output_path.with_file_name(format!(".{file_name}.tmp"))
 }
 
+fn retry_file_op<F>(mut op: F) -> std::io::Result<()>
+where
+    F: FnMut() -> std::io::Result<()>,
+{
+    let mut last_error: Option<std::io::Error> = None;
+    for attempt in 0..FILE_OP_RETRY_ATTEMPTS {
+        match op() {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_error = Some(err);
+                if attempt + 1 < FILE_OP_RETRY_ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(25 * (attempt as u64 + 1)));
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| std::io::Error::other("file operation failed")))
+}
+
+fn remove_file_with_retry(path: &Path) -> std::io::Result<()> {
+    retry_file_op(|| match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    })
+}
+
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    retry_file_op(|| std::fs::rename(from, to))
+}
+
 fn restore_batch_columns(
     batch: &RecordBatch,
     input_path: &str,
@@ -1507,28 +1540,33 @@ pub fn restore_with_coord_file_impl(
     }
     let mut output_paths: Vec<String> = Vec::new();
     for (_path, managed) in writers {
-        managed.writer.close().map_err(|err| {
+        let ManagedParquetWriter {
+            writer,
+            final_path,
+            temp_path,
+        } = managed;
+        writer.close().map_err(|err| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "failed to finalize output parquet {}: {err}",
-                managed.temp_path.display()
+                temp_path.display()
             ))
         })?;
-        if managed.final_path.exists() {
-            std::fs::remove_file(&managed.final_path).map_err(|err| {
+        if final_path.exists() {
+            remove_file_with_retry(&final_path).map_err(|err| {
                 pyo3::exceptions::PyValueError::new_err(format!(
                     "failed to replace existing output parquet {}: {err}",
-                    managed.final_path.display()
+                    final_path.display()
                 ))
             })?;
         }
-        std::fs::rename(&managed.temp_path, &managed.final_path).map_err(|err| {
+        rename_with_retry(&temp_path, &final_path).map_err(|err| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "failed to publish output parquet {} -> {}: {err}",
-                managed.temp_path.display(),
-                managed.final_path.display()
+                temp_path.display(),
+                final_path.display()
             ))
         })?;
-        output_paths.push(managed.final_path.to_string_lossy().to_string());
+        output_paths.push(final_path.to_string_lossy().to_string());
     }
     let parquet_write_sec = write_started.elapsed().as_secs_f64();
     if drop_cache_hint {
