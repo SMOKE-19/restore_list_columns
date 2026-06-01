@@ -45,7 +45,7 @@ jobs:
           working-directory: rust_restore_list_columns
           command: build
           args: --release --out dist --interpreter python${{ matrix.python-version }}
-          manylinux: auto
+          manylinux: "2014"
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
