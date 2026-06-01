@@ -1,5 +1,7 @@
 use arrow_array::{
-    Array, Float64Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+    Array, Date32Array, Date64Array, Float32Array, Float64Array, Int32Array, Int64Array,
+    LargeStringArray, RecordBatch, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow_ipc::writer::FileWriter;
 use arrow_schema::{DataType, Field, Schema};
@@ -67,6 +69,7 @@ enum ScalarValue {
     String(String),
     Int(i64),
     Float(f64),
+    Timestamp(i64),
 }
 
 struct CoordBuffers {
@@ -254,6 +257,27 @@ fn scalar_value(
     if let Some(values) = column.as_any().downcast_ref::<Int64Array>() {
         return Ok(ScalarValue::Int(values.value(row_index)));
     }
+    if let Some(values) = column.as_any().downcast_ref::<Date32Array>() {
+        return Ok(ScalarValue::Int(values.value(row_index) as i64));
+    }
+    if let Some(values) = column.as_any().downcast_ref::<Date64Array>() {
+        return Ok(ScalarValue::Timestamp(values.value(row_index)));
+    }
+    if let Some(values) = column.as_any().downcast_ref::<TimestampSecondArray>() {
+        return Ok(ScalarValue::Timestamp(values.value(row_index)));
+    }
+    if let Some(values) = column.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        return Ok(ScalarValue::Timestamp(values.value(row_index)));
+    }
+    if let Some(values) = column.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        return Ok(ScalarValue::Timestamp(values.value(row_index)));
+    }
+    if let Some(values) = column.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        return Ok(ScalarValue::Timestamp(values.value(row_index)));
+    }
+    if let Some(values) = column.as_any().downcast_ref::<Float32Array>() {
+        return Ok(ScalarValue::Float(values.value(row_index) as f64));
+    }
     if let Some(values) = column.as_any().downcast_ref::<Float64Array>() {
         return Ok(ScalarValue::Float(values.value(row_index)));
     }
@@ -269,6 +293,7 @@ fn scalar_to_string(value: &ScalarValue) -> Option<String> {
         ScalarValue::String(value) => Some(value.clone()),
         ScalarValue::Int(value) => Some(value.to_string()),
         ScalarValue::Float(value) => Some(value.to_string()),
+        ScalarValue::Timestamp(value) => Some(value.to_string()),
     }
 }
 
@@ -278,6 +303,9 @@ fn scalar_cmp(left: &ScalarValue, right: &ScalarValue) -> Ordering {
         (ScalarValue::Null, _) => Ordering::Less,
         (_, ScalarValue::Null) => Ordering::Greater,
         (ScalarValue::Int(a), ScalarValue::Int(b)) => a.cmp(b),
+        (ScalarValue::Timestamp(a), ScalarValue::Timestamp(b)) => a.cmp(b),
+        (ScalarValue::Int(a), ScalarValue::Timestamp(b)) => a.cmp(b),
+        (ScalarValue::Timestamp(a), ScalarValue::Int(b)) => a.cmp(b),
         (ScalarValue::Float(a), ScalarValue::Float(b)) => {
             a.partial_cmp(b).unwrap_or(Ordering::Equal)
         }

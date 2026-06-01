@@ -24,7 +24,7 @@ __all__ = [
     "restore_with_coord_file",
 ]
 
-__version__ = "2.0.1"
+__version__ = "2.0.2"
 
 
 def plan_restore_coords(

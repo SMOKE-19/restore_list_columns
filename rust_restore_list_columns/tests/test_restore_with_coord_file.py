@@ -294,6 +294,47 @@ def test_plan_restore_coords_applies_thin_filters_and_dedupe(tmp_path: Path) -> 
     assert stats["selected_row_count"] == 2.0
 
 
+def test_plan_restore_coords_dedupe_supports_timestamp_nanosecond_sort(tmp_path: Path) -> None:
+    source = tmp_path / "source_timestamp_ns.parquet"
+    coord_dir = tmp_path / "coords"
+
+    table = pa.table(
+        {
+            "id": pa.array(["old_a", "new_a", "old_b", "new_b"]),
+            "group_key": pa.array(["A", "A", "B", "B"]),
+            "updated_at": pa.array(
+                [
+                    1_700_000_000_000_000_001,
+                    1_700_000_000_000_000_010,
+                    1_700_000_000_000_000_003,
+                    1_700_000_000_000_000_020,
+                ],
+                type=pa.timestamp("ns"),
+            ),
+        }
+    )
+    pq.write_table(table, source, row_group_size=2)
+
+    stats = restore_list_columns_rs.plan_restore_coords(
+        [str(source)],
+        str(coord_dir),
+        filter_config={
+            "dedupe": {
+                "enabled": True,
+                "group_keys": ["group_key"],
+                "sort": [{"column": "updated_at", "direction": "desc"}],
+            },
+        },
+        planner_config={"row_count": 10},
+    )
+
+    coord_files = sorted(coord_dir.glob("*.arrow"))
+    assert len(coord_files) == 1
+    coords = pl.read_ipc(coord_files[0]).sort("row_index")
+    assert coords.get_column("row_index").to_list() == [1, 3]
+    assert stats["selected_row_count"] == 2.0
+
+
 def test_plan_restore_coords_supports_in_like_and_or_filters(tmp_path: Path) -> None:
     source = tmp_path / "source.parquet"
     coord_dir = tmp_path / "coords"
