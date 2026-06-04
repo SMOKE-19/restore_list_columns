@@ -17,6 +17,10 @@ use std::time::Instant;
 #[derive(Debug, Deserialize)]
 struct PlannerConfig {
     row_count: Option<usize>,
+    #[serde(default)]
+    row_keys: Vec<String>,
+    mode: Option<String>,
+    max_source_files_per_chunk: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -213,6 +217,25 @@ fn required_filter_columns(filter_config: &FilterConfig) -> Vec<String> {
                     columns.push(rule.column.clone());
                 }
             }
+        }
+    }
+    columns
+}
+
+fn required_planner_columns(
+    filter_config: &FilterConfig,
+    planner_config: &PlannerConfig,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut columns = Vec::new();
+    for column in required_filter_columns(filter_config) {
+        if seen.insert(column.clone()) {
+            columns.push(column);
+        }
+    }
+    for column in &planner_config.row_keys {
+        if seen.insert(column.clone()) {
+            columns.push(column.clone());
         }
     }
     columns
@@ -438,6 +461,177 @@ fn apply_dedupe(rows: Vec<CandidateRow>, dedupe: Option<&DedupeConfig>) -> Vec<C
     kept
 }
 
+fn row_key_signature(row: &CandidateRow, row_keys: &[String]) -> Vec<String> {
+    row_keys
+        .iter()
+        .map(|column| {
+            scalar_to_string(row.values.get(column).unwrap_or(&ScalarValue::Null))
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn natural_sort_key(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut current_is_digit: Option<bool> = None;
+    for ch in value.chars() {
+        let is_digit = ch.is_ascii_digit();
+        if current_is_digit == Some(is_digit) {
+            current.push(ch);
+            continue;
+        }
+        if !current.is_empty() {
+            if current_is_digit == Some(true) {
+                parts.push(format!("{:020}", current.parse::<u64>().unwrap_or(0)));
+            } else {
+                parts.push(current.clone());
+            }
+            current.clear();
+        }
+        current_is_digit = Some(is_digit);
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        if current_is_digit == Some(true) {
+            parts.push(format!("{:020}", current.parse::<u64>().unwrap_or(0)));
+        } else {
+            parts.push(current);
+        }
+    }
+    parts
+}
+
+fn source_file_locality_signature(files: &HashSet<String>) -> String {
+    let mut ordered = files.iter().cloned().collect::<Vec<_>>();
+    ordered.sort_by_key(|value| natural_sort_key(value));
+    ordered.join("\u{1f}")
+}
+
+fn write_selected_rows_by_row_order(
+    coord_output_dir: &str,
+    rows: Vec<CandidateRow>,
+    row_count: usize,
+) -> pyo3::PyResult<(usize, u64, usize, usize, f64)> {
+    let mut coord_chunk_count = 0usize;
+    let mut coord_total_size_bytes = 0u64;
+    let mut buffers = CoordBuffers::new();
+    for row in rows {
+        if buffers.len() >= row_count {
+            coord_total_size_bytes +=
+                write_coord_chunk(coord_output_dir, coord_chunk_count, buffers)?;
+            coord_chunk_count += 1;
+            buffers = CoordBuffers::new();
+        }
+        buffers.push(
+            &row.source_file,
+            row.row_group_id,
+            row.row_index,
+            row.row_offset_in_group,
+            coord_chunk_count,
+        )?;
+    }
+    if !buffers.is_empty() {
+        coord_total_size_bytes += write_coord_chunk(coord_output_dir, coord_chunk_count, buffers)?;
+        coord_chunk_count += 1;
+    }
+    Ok((coord_chunk_count, coord_total_size_bytes, 0, 0, 0.0))
+}
+
+fn write_selected_rows_by_source_file_locality(
+    coord_output_dir: &str,
+    rows: Vec<CandidateRow>,
+    row_keys: &[String],
+    row_count: usize,
+    max_source_files_per_chunk: Option<usize>,
+) -> pyo3::PyResult<(usize, u64, usize, usize, f64)> {
+    let mut groups: HashMap<Vec<String>, (Vec<CandidateRow>, HashSet<String>, usize)> =
+        HashMap::new();
+    for row in rows {
+        let signature = row_key_signature(&row, row_keys);
+        let ordinal = row.ordinal;
+        let source_file = row.source_file.clone();
+        let entry = groups
+            .entry(signature)
+            .or_insert_with(|| (Vec::new(), HashSet::new(), ordinal));
+        entry.0.push(row);
+        entry.1.insert(source_file);
+        entry.2 = entry.2.min(ordinal);
+    }
+
+    let mut ordered = groups.into_iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        let left_files = source_file_locality_signature(&(left.1).1);
+        let right_files = source_file_locality_signature(&(right.1).1);
+        left_files
+            .cmp(&right_files)
+            .then((left.1).1.len().cmp(&(right.1).1.len()))
+            .then(left.0.cmp(&right.0))
+            .then((left.1).2.cmp(&(right.1).2))
+    });
+
+    let mut coord_chunk_count = 0usize;
+    let mut coord_total_size_bytes = 0u64;
+    let mut current_row_key_count = 0usize;
+    let mut current_files: HashSet<String> = HashSet::new();
+    let mut buffers = CoordBuffers::new();
+    let mut chunk_file_counts = Vec::new();
+
+    for (_row_key, (mut group_rows, group_files, _ordinal)) in ordered {
+        let next_files = current_files
+            .union(&group_files)
+            .cloned()
+            .collect::<HashSet<_>>();
+        let would_exceed_rows = current_row_key_count >= row_count;
+        let would_exceed_files = max_source_files_per_chunk
+            .map(|limit| current_row_key_count > 0 && next_files.len() > limit)
+            .unwrap_or(false);
+        if !buffers.is_empty() && (would_exceed_rows || would_exceed_files) {
+            chunk_file_counts.push(current_files.len());
+            coord_total_size_bytes +=
+                write_coord_chunk(coord_output_dir, coord_chunk_count, buffers)?;
+            coord_chunk_count += 1;
+            buffers = CoordBuffers::new();
+            current_row_key_count = 0;
+            current_files = HashSet::new();
+        }
+
+        group_rows.sort_by_key(|row| row.ordinal);
+        for row in group_rows {
+            buffers.push(
+                &row.source_file,
+                row.row_group_id,
+                row.row_index,
+                row.row_offset_in_group,
+                coord_chunk_count,
+            )?;
+        }
+        current_row_key_count += 1;
+        current_files.extend(group_files);
+    }
+
+    if !buffers.is_empty() {
+        chunk_file_counts.push(current_files.len());
+        coord_total_size_bytes += write_coord_chunk(coord_output_dir, coord_chunk_count, buffers)?;
+        coord_chunk_count += 1;
+    }
+
+    let min_files = chunk_file_counts.iter().copied().min().unwrap_or(0);
+    let max_files = chunk_file_counts.iter().copied().max().unwrap_or(0);
+    let avg_files = if chunk_file_counts.is_empty() {
+        0.0
+    } else {
+        chunk_file_counts.iter().sum::<usize>() as f64 / chunk_file_counts.len() as f64
+    };
+    Ok((
+        coord_chunk_count,
+        coord_total_size_bytes,
+        min_files,
+        max_files,
+        avg_files,
+    ))
+}
+
 fn collect_candidate_rows(
     source_file: &str,
     filter_config: &FilterConfig,
@@ -574,43 +768,48 @@ pub fn plan_restore_coords_impl(
             .map_err(|err| {
                 pyo3::exceptions::PyValueError::new_err(format!("invalid planner config: {err}"))
             })?,
-        _ => PlannerConfig { row_count: None },
+        _ => PlannerConfig {
+            row_count: None,
+            row_keys: Vec::new(),
+            mode: None,
+            max_source_files_per_chunk: None,
+        },
     };
     let row_count = planner_config.row_count.unwrap_or(10_000).max(1);
 
     let mut input_row_group_count = 0usize;
-    let mut selected_row_count = 0usize;
-    let mut coord_chunk_count = 0usize;
-    let mut coord_total_size_bytes = 0u64;
-    let mut buffers = CoordBuffers::new();
-    let required_columns = required_filter_columns(&filter_config);
+    let required_columns = required_planner_columns(&filter_config, &planner_config);
+    let mut selected_rows = Vec::new();
 
     for source_file in &input_parquet_paths {
         let (candidate_rows, row_group_count) =
             collect_candidate_rows(source_file, &filter_config, &required_columns)?;
         input_row_group_count += row_group_count;
-        let selected_rows = apply_dedupe(candidate_rows, filter_config.dedupe.as_ref());
-        for row in selected_rows {
-            if buffers.len() >= row_count {
-                coord_total_size_bytes +=
-                    write_coord_chunk(&coord_output_dir, coord_chunk_count, buffers)?;
-                coord_chunk_count += 1;
-                buffers = CoordBuffers::new();
-            }
-            buffers.push(
-                &row.source_file,
-                row.row_group_id,
-                row.row_index,
-                row.row_offset_in_group,
-                coord_chunk_count,
-            )?;
-            selected_row_count += 1;
-        }
+        selected_rows.extend(apply_dedupe(candidate_rows, filter_config.dedupe.as_ref()));
     }
-    if !buffers.is_empty() {
-        coord_total_size_bytes += write_coord_chunk(&coord_output_dir, coord_chunk_count, buffers)?;
-        coord_chunk_count += 1;
-    }
+    let selected_row_count = selected_rows.len();
+    let planner_mode = planner_config
+        .mode
+        .clone()
+        .unwrap_or_else(|| "row_order".to_string())
+        .to_ascii_lowercase();
+    let (
+        coord_chunk_count,
+        coord_total_size_bytes,
+        chunk_source_file_count_min,
+        chunk_source_file_count_max,
+        chunk_source_file_count_avg,
+    ) = if planner_mode == "source_file_locality" && !planner_config.row_keys.is_empty() {
+        write_selected_rows_by_source_file_locality(
+            &coord_output_dir,
+            selected_rows,
+            &planner_config.row_keys,
+            row_count,
+            planner_config.max_source_files_per_chunk,
+        )?
+    } else {
+        write_selected_rows_by_row_order(&coord_output_dir, selected_rows, row_count)?
+    };
 
     let mut stats = HashMap::new();
     stats.insert(
@@ -629,8 +828,28 @@ pub fn plan_restore_coords_impl(
     stats.insert("selected_row_count".to_string(), selected_row_count as f64);
     stats.insert("coord_chunk_count".to_string(), coord_chunk_count as f64);
     stats.insert(
+        "chunk_source_file_count_min".to_string(),
+        chunk_source_file_count_min as f64,
+    );
+    stats.insert(
+        "chunk_source_file_count_max".to_string(),
+        chunk_source_file_count_max as f64,
+    );
+    stats.insert(
+        "chunk_source_file_count_avg".to_string(),
+        chunk_source_file_count_avg,
+    );
+    stats.insert(
         "coord_total_size_bytes".to_string(),
         coord_total_size_bytes as f64,
+    );
+    stats.insert(
+        "planner_mode_source_file_locality".to_string(),
+        if planner_mode == "source_file_locality" && !planner_config.row_keys.is_empty() {
+            1.0
+        } else {
+            0.0
+        },
     );
     stats.insert(
         "planner_elapsed_sec".to_string(),

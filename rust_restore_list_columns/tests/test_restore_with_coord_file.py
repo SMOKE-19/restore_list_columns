@@ -512,6 +512,46 @@ def test_plan_restore_coords_writes_row_count_chunks(tmp_path: Path) -> None:
     assert first.get_column("row_offset_in_group").to_list() == [0, 1]
 
 
+def test_plan_restore_coords_can_chunk_by_source_file_locality(tmp_path: Path) -> None:
+    source_a = tmp_path / "source-000.parquet"
+    source_b = tmp_path / "source-001.parquet"
+    coord_dir = tmp_path / "coords"
+
+    pl.DataFrame(
+        {
+            "row_key": ["A", "B"],
+            "payload": [1, 2],
+        }
+    ).write_parquet(source_a, row_group_size=1)
+    pl.DataFrame(
+        {
+            "row_key": ["C", "D"],
+            "payload": [3, 4],
+        }
+    ).write_parquet(source_b, row_group_size=1)
+
+    stats = restore_list_columns_rs.plan_restore_coords(
+        [str(source_a), str(source_b)],
+        str(coord_dir),
+        planner_config={
+            "row_count": 10,
+            "mode": "source_file_locality",
+            "row_keys": ["row_key"],
+            "max_source_files_per_chunk": 1,
+        },
+    )
+
+    coord_files = sorted(coord_dir.glob("*.arrow"))
+    assert len(coord_files) == 2
+    assert stats["planner_mode_source_file_locality"] == 1.0
+    assert stats["chunk_source_file_count_max"] == 1.0
+    assert stats["selected_row_count"] == 4.0
+    assert [
+        sorted(set(pl.read_ipc(path).get_column("source_file").to_list()))
+        for path in coord_files
+    ] == [[str(source_a)], [str(source_b)]]
+
+
 def test_plan_restore_coords_applies_thin_filters_and_dedupe(tmp_path: Path) -> None:
     source = tmp_path / "source.parquet"
     coord_dir = tmp_path / "coords"
