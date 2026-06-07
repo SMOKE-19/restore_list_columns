@@ -28,11 +28,16 @@ const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Deserialize)]
 struct RestoreConfig {
+    #[serde(default = "default_restore_enabled")]
+    enabled: bool,
+    #[serde(default)]
     key_column: String,
+    #[serde(default)]
     order_column: String,
     #[serde(default)]
     value_columns: Vec<String>,
     value_column: Option<String>,
+    #[serde(default)]
     coord_columns: Vec<String>,
 }
 
@@ -103,6 +108,10 @@ struct DetailedProfile {
     cache_hint_calls: usize,
 }
 
+fn default_restore_enabled() -> bool {
+    true
+}
+
 fn normalize_dtype(dtype: &str) -> &str {
     match dtype {
         "TEXT" | "Utf8" | "String" => "TEXT",
@@ -126,6 +135,19 @@ fn parse_config(config_json: &str) -> pyo3::PyResult<RestoreConfig> {
     let mut config: RestoreConfig = serde_json::from_str(config_json).map_err(|err| {
         pyo3::exceptions::PyValueError::new_err(format!("invalid restore config: {err}"))
     })?;
+    if !config.enabled {
+        return Ok(config);
+    }
+    if config.key_column.trim().is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "key_column is required when list restore is enabled.",
+        ));
+    }
+    if config.order_column.trim().is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "order_column is required when list restore is enabled.",
+        ));
+    }
     if config.coord_columns.len() != 2 {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "coord_columns must contain exactly 2 items, got {}",
@@ -1090,6 +1112,38 @@ fn restore_batch_columns(
     Ok(restored_batch)
 }
 
+fn cast_projected_batch_for_output(
+    batch: &RecordBatch,
+    schema: &HashMap<String, String>,
+    detailed_profile: Option<&mut DetailedProfile>,
+) -> pyo3::PyResult<RecordBatch> {
+    let build_started = Instant::now();
+    let output_schema = build_output_schema(batch.schema().as_ref(), schema)?;
+    let mut output_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    let batch_schema = batch.schema();
+    for index in 0..batch.num_columns() {
+        let field = batch_schema.field(index);
+        let output_field = output_schema.field(index);
+        output_columns.push(cast_array_for_output(
+            batch.column(index).clone(),
+            output_field,
+            field.name(),
+        )?);
+    }
+    let restored_batch = RecordBatch::try_new(output_schema, output_columns).map_err(|err| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "failed to build casted record batch: {err}"
+        ))
+    })?;
+    if let Some(profile) = detailed_profile {
+        profile.batches_processed += 1;
+        profile.input_rows += batch.num_rows();
+        profile.max_batch_rows = profile.max_batch_rows.max(batch.num_rows());
+        profile.record_batch_build_sec += build_started.elapsed().as_secs_f64();
+    }
+    Ok(restored_batch)
+}
+
 fn restore_parquet_to_parquet_internal(
     input_parquet_path: String,
     output_parquet_path: String,
@@ -1390,13 +1444,20 @@ pub fn restore_with_coord_file_impl(
     };
 
     let reference_started = Instant::now();
-    let refs = load_reference_map(
-        &lookup_path,
-        &config.key_column,
-        &config.order_column,
-        &config.coord_columns,
-    )?;
-    let dense_index_cache = build_dense_index_cache(&refs)?;
+    let restore_refs = if config.enabled {
+        Some(load_reference_map(
+            &lookup_path,
+            &config.key_column,
+            &config.order_column,
+            &config.coord_columns,
+        )?)
+    } else {
+        None
+    };
+    let dense_index_cache = match &restore_refs {
+        Some(refs) => Some(build_dense_index_cache(refs)?),
+        None => None,
+    };
     let reference_replace_map = match &writer_config.reference_replace {
         Some(config) => Some(load_reference_replace_map(config)?),
         None => None,
@@ -1482,16 +1543,30 @@ pub fn restore_with_coord_file_impl(
                 ))
             })?;
             let batch = apply_projection(&raw_batch, &writer_config.projection_columns)?;
-            let restored = restore_batch_columns(
-                &batch,
-                &group.source_file,
-                &config,
-                &schema,
-                &refs,
-                &dense_index_cache,
-                build_output_schema(batch.schema().as_ref(), &schema)?,
-                Some(&mut detailed_profile),
-            )?;
+            let restored = if config.enabled {
+                let refs = restore_refs.as_ref().ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err("missing restore references")
+                })?;
+                let dense_index_cache = dense_index_cache.as_ref().ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err("missing dense index cache")
+                })?;
+                restore_batch_columns(
+                    &batch,
+                    &group.source_file,
+                    &config,
+                    &schema,
+                    refs,
+                    dense_index_cache,
+                    build_output_schema(batch.schema().as_ref(), &schema)?,
+                    Some(&mut detailed_profile),
+                )?
+            } else {
+                cast_projected_batch_for_output(
+                    &batch,
+                    &schema,
+                    Some(&mut detailed_profile),
+                )?
+            };
             let restored = match (&writer_config.reference_replace, &reference_replace_map) {
                 (Some(config), Some(mapping)) => {
                     apply_reference_replace(&restored, config, mapping, &group.source_file)?
@@ -1617,6 +1692,7 @@ pub fn restore_with_coord_file_impl(
     stats.insert("restore_elapsed_sec".to_string(), restore_sec);
     stats.insert("write_elapsed_sec".to_string(), parquet_write_sec);
     stats.insert("total_sec".to_string(), total_sec);
+    stats.insert("pivot_enabled".to_string(), 0.0);
     stats.insert(
         "batches_processed".to_string(),
         detailed_profile.batches_processed as f64,

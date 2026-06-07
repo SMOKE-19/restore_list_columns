@@ -170,6 +170,45 @@ def test_restore_with_coord_file_selects_only_coord_rows(tmp_path: Path) -> None
     assert stats["row_group_count"] == 2.0
 
 
+def test_restore_with_coord_file_can_disable_list_restore_and_only_project_cast(tmp_path: Path) -> None:
+    source = tmp_path / "source.parquet"
+    coord = tmp_path / "coord.arrow"
+    output_dir = tmp_path / "out"
+
+    pl.DataFrame(
+        {
+            "raw_id": ["r0", "r1", "r2", "r3"],
+            "bucket": ["A", "A", "B", "B"],
+            "amount": [10, 20, 30, 40],
+        }
+    ).write_parquet(source, row_group_size=2)
+    _write_coord_file(coord, source)
+
+    stats = restore_list_columns_rs.restore_with_coord_file(
+        str(coord),
+        str(output_dir),
+        "",
+        {"id": "TEXT", "bucket": "TEXT", "amount": "DOUBLE"},
+        {"enabled": False},
+        {
+            "output_file_name": "part-projected.parquet",
+            "projection_columns": [
+                {"name": "id", "source": "raw_id"},
+                {"name": "bucket", "source": "bucket"},
+                {"name": "amount", "source": "amount"},
+            ],
+        },
+        batch_size=16,
+    )
+
+    projected = pl.read_parquet(output_dir / "part-projected.parquet").sort("id")
+    assert projected.columns == ["id", "bucket", "amount"]
+    assert projected.get_column("id").to_list() == ["r1", "r3"]
+    assert projected.get_column("amount").to_list() == [20.0, 40.0]
+    assert stats["rows_written"] == 2.0
+    assert stats["value_column_count"] == 0.0
+
+
 def test_restore_with_coord_file_can_partition_output(tmp_path: Path) -> None:
     source = tmp_path / "source.parquet"
     lookup = tmp_path / "lookup.parquet"
