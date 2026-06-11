@@ -59,7 +59,8 @@ def test_restore_parquet_accepts_large_binary_json_columns(tmp_path: Path) -> No
             "key_column": "group",
             "order_column": "ord",
             "value_columns": ["value"],
-            "coord_columns": ["coord_a", "coord_b"],
+            "source_coord_columns": ["coord_a", "coord_b"],
+            "lookup_coord_columns": ["coord_a", "coord_b"],
         },
         batch_size=16,
     )
@@ -109,7 +110,8 @@ def test_restore_parquet_restores_multiple_value_column_types(tmp_path: Path) ->
             "key_column": "group",
             "order_column": "ord",
             "value_columns": ["value_float", "value_int", "value_text"],
-            "coord_columns": ["coord_a", "coord_b"],
+            "source_coord_columns": ["coord_a", "coord_b"],
+            "lookup_coord_columns": ["coord_a", "coord_b"],
         },
     )
 
@@ -117,6 +119,47 @@ def test_restore_parquet_restores_multiple_value_column_types(tmp_path: Path) ->
     assert restored.get_column("value_float").to_list() == [[1.5, 3.5, None]]
     assert restored.get_column("value_int").to_list() == [[10, 30, None]]
     assert restored.get_column("value_text").to_list() == [["hot", "cold", None]]
+
+
+def test_restore_rejects_legacy_coord_columns_key(tmp_path: Path) -> None:
+    source = tmp_path / "source.parquet"
+    lookup = tmp_path / "lookup.parquet"
+    output = tmp_path / "restored.parquet"
+
+    pl.DataFrame(
+        {
+            "group": ["A"],
+            "value": ["[10]"],
+            "coord_a": ["[0]"],
+            "coord_b": ["[0]"],
+        }
+    ).write_parquet(source)
+    pl.DataFrame(
+        {
+            "group": ["A"],
+            "ord": [0],
+            "coord_a": [0],
+            "coord_b": [0],
+        }
+    ).write_parquet(lookup)
+
+    try:
+        restore_list_columns_rs.restore_parquet_to_parquet(
+            str(source),
+            str(output),
+            str(lookup),
+            {"value": "INTEGER[]", "coord_a": "INTEGER[]", "coord_b": "INTEGER[]"},
+            {
+                "key_column": "group",
+                "order_column": "ord",
+                "value_columns": ["value"],
+                "coord_columns": ["coord_a", "coord_b"],
+            },
+        )
+    except ValueError as exc:
+        assert "source_coord_columns must contain exactly 2 items" in str(exc)
+    else:
+        raise AssertionError("legacy coord_columns key must be rejected")
 
 
 def test_restore_with_coord_file_selects_only_coord_rows(tmp_path: Path) -> None:
@@ -153,7 +196,8 @@ def test_restore_with_coord_file_selects_only_coord_rows(tmp_path: Path) -> None
             "key_column": "group",
             "order_column": "ord",
             "value_columns": ["value"],
-            "coord_columns": ["coord_a", "coord_b"],
+            "source_coord_columns": ["coord_a", "coord_b"],
+            "lookup_coord_columns": ["coord_a", "coord_b"],
         },
         {"output_file_name": "part-test.parquet"},
         batch_size=16,
@@ -168,6 +212,63 @@ def test_restore_with_coord_file_selects_only_coord_rows(tmp_path: Path) -> None
     assert stats["rows_written"] == 2.0
     assert stats["source_file_count"] == 1.0
     assert stats["row_group_count"] == 2.0
+
+
+def test_restore_with_coord_file_separates_source_and_lookup_coord_columns(tmp_path: Path) -> None:
+    source = tmp_path / "source.parquet"
+    lookup = tmp_path / "lookup.parquet"
+    coord = tmp_path / "coord.arrow"
+    output_dir = tmp_path / "out"
+
+    pl.DataFrame(
+        {
+            "id": ["r0", "r1"],
+            "group": ["A", "A"],
+            "value": ["[10]", "[30]"],
+            "src_x": ["[0]", "[1]"],
+            "src_y": ["[0]", "[0]"],
+        }
+    ).write_parquet(source, row_group_size=1)
+    pl.DataFrame(
+        {
+            "group": ["A", "A"],
+            "ord": [0, 1],
+            "lk_x": [0, 1],
+            "lk_y": [0, 0],
+        }
+    ).write_parquet(lookup)
+    coord_table = pa.table(
+        {
+            "source_file": [str(source), str(source)],
+            "row_group_id": pa.array([0, 1], type=pa.int32()),
+            "row_index": pa.array([0, 1], type=pa.int64()),
+            "row_offset_in_group": pa.array([0, 0], type=pa.int32()),
+            "planner_chunk_id": pa.array([0, 0], type=pa.int32()),
+        }
+    )
+    with ipc.new_file(coord, coord_table.schema) as writer:
+        writer.write_table(coord_table)
+
+    restore_list_columns_rs.restore_with_coord_file(
+        str(coord),
+        str(output_dir),
+        str(lookup),
+        {"value": "INTEGER[]", "src_x": "INTEGER[]", "src_y": "INTEGER[]"},
+        {
+            "key_column": "group",
+            "order_column": "ord",
+            "value_columns": ["value"],
+            "source_coord_columns": ["src_x", "src_y"],
+            "lookup_coord_columns": ["lk_x", "lk_y"],
+        },
+        {"output_file_name": "part-test.parquet"},
+        batch_size=16,
+    )
+
+    restored = pl.read_parquet(output_dir / "part-test.parquet").sort("id")
+    assert restored.get_column("value").to_list() == [[10, None], [None, 30]]
+    assert restored.get_column("src_x").to_list() == [[0, 1], [0, 1]]
+    assert restored.get_column("src_y").to_list() == [[0, 0], [0, 0]]
 
 
 def test_restore_with_coord_file_can_disable_list_restore_and_only_project_cast(tmp_path: Path) -> None:
@@ -244,7 +345,8 @@ def test_restore_with_coord_file_can_partition_output(tmp_path: Path) -> None:
             "key_column": "group",
             "order_column": "ord",
             "value_columns": ["value"],
-            "coord_columns": ["coord_a", "coord_b"],
+            "source_coord_columns": ["coord_a", "coord_b"],
+            "lookup_coord_columns": ["coord_a", "coord_b"],
         },
         {"partition_columns": ["bucket"], "file_name_prefix": "part-test"},
     )
@@ -298,7 +400,8 @@ def test_restore_with_coord_file_sanitizes_partition_values_and_nulls(tmp_path: 
             "key_column": "group",
             "order_column": "ord",
             "value_columns": ["value"],
-            "coord_columns": ["coord_a", "coord_b"],
+            "source_coord_columns": ["coord_a", "coord_b"],
+            "lookup_coord_columns": ["coord_a", "coord_b"],
         },
         {"partition_columns": ["bucket"], "file_name_prefix": "part-test"},
     )
@@ -344,7 +447,8 @@ def test_restore_with_coord_file_applies_reference_replace(tmp_path: Path) -> No
             "key_column": "group",
             "order_column": "ord",
             "value_columns": ["value"],
-            "coord_columns": ["coord_a", "coord_b"],
+            "source_coord_columns": ["coord_a", "coord_b"],
+            "lookup_coord_columns": ["coord_a", "coord_b"],
         },
         {
             "output_file_name": "part-test.parquet",
@@ -407,7 +511,8 @@ def test_restore_with_coord_file_does_not_publish_partial_parquet_on_error(tmp_p
                 "key_column": "group",
                 "order_column": "ord",
                 "value_columns": ["value"],
-                "coord_columns": ["coord_a", "coord_b"],
+                "source_coord_columns": ["coord_a", "coord_b"],
+                "lookup_coord_columns": ["coord_a", "coord_b"],
             },
             {"output_file_name": "part-test.parquet"},
         )
@@ -457,7 +562,8 @@ def test_restore_with_coord_file_replaces_existing_output_and_cleans_temp(tmp_pa
             "key_column": "group",
             "order_column": "ord",
             "value_columns": ["value"],
-            "coord_columns": ["coord_a", "coord_b"],
+            "source_coord_columns": ["coord_a", "coord_b"],
+            "lookup_coord_columns": ["coord_a", "coord_b"],
         },
         {"output_file_name": final_output.name},
     )
@@ -506,7 +612,8 @@ def test_restore_with_coord_file_rejects_invalid_binary_json_without_output(tmp_
                 "key_column": "group",
                 "order_column": "ord",
                 "value_columns": ["value"],
-                "coord_columns": ["coord_a", "coord_b"],
+                "source_coord_columns": ["coord_a", "coord_b"],
+                "lookup_coord_columns": ["coord_a", "coord_b"],
             },
             {"output_file_name": "part-test.parquet"},
         )

@@ -38,7 +38,9 @@ struct RestoreConfig {
     value_columns: Vec<String>,
     value_column: Option<String>,
     #[serde(default)]
-    coord_columns: Vec<String>,
+    source_coord_columns: Vec<String>,
+    #[serde(default)]
+    lookup_coord_columns: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,10 +150,16 @@ fn parse_config(config_json: &str) -> pyo3::PyResult<RestoreConfig> {
             "order_column is required when list restore is enabled.",
         ));
     }
-    if config.coord_columns.len() != 2 {
+    if config.source_coord_columns.len() != 2 {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "coord_columns must contain exactly 2 items, got {}",
-            config.coord_columns.len()
+            "source_coord_columns must contain exactly 2 items, got {}",
+            config.source_coord_columns.len()
+        )));
+    }
+    if config.lookup_coord_columns.len() != 2 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "lookup_coord_columns must contain exactly 2 items, got {}",
+            config.lookup_coord_columns.len()
         )));
     }
     if config.value_columns.is_empty() {
@@ -948,8 +956,10 @@ fn restore_batch_columns(
         .iter()
         .map(|column_name| batch_string_values(batch, column_name, input_path))
         .collect::<pyo3::PyResult<Vec<_>>>()?;
-    let coord_a_sparse_json = batch_string_values(batch, &config.coord_columns[0], input_path)?;
-    let coord_b_sparse_json = batch_string_values(batch, &config.coord_columns[1], input_path)?;
+    let coord_a_sparse_json =
+        batch_string_values(batch, &config.source_coord_columns[0], input_path)?;
+    let coord_b_sparse_json =
+        batch_string_values(batch, &config.source_coord_columns[1], input_path)?;
     let extract_sec = extract_started.elapsed().as_secs_f64();
 
     let mut value_builders = build_value_column_builders(schema, &config.value_columns)?;
@@ -1065,13 +1075,13 @@ fn restore_batch_columns(
                 output_field,
                 column_name,
             )?);
-        } else if column_name == &config.coord_columns[0] {
+        } else if column_name == &config.source_coord_columns[0] {
             output_columns.push(cast_array_for_output(
                 Arc::new(coord_a_builder.finish()) as ArrayRef,
                 output_field,
                 column_name,
             )?);
-        } else if column_name == &config.coord_columns[1] {
+        } else if column_name == &config.source_coord_columns[1] {
             output_columns.push(cast_array_for_output(
                 Arc::new(coord_b_builder.finish()) as ArrayRef,
                 output_field,
@@ -1169,7 +1179,7 @@ fn restore_parquet_to_parquet_internal(
         &lookup_path,
         &config.key_column,
         &config.order_column,
-        &config.coord_columns,
+        &config.lookup_coord_columns,
     )?;
     let dense_index_cache = build_dense_index_cache(&refs)?;
     let reference_load_sec = reference_started.elapsed().as_secs_f64();
@@ -1449,7 +1459,7 @@ pub fn restore_with_coord_file_impl(
             &lookup_path,
             &config.key_column,
             &config.order_column,
-            &config.coord_columns,
+            &config.lookup_coord_columns,
         )?)
     } else {
         None
@@ -1561,11 +1571,7 @@ pub fn restore_with_coord_file_impl(
                     Some(&mut detailed_profile),
                 )?
             } else {
-                cast_projected_batch_for_output(
-                    &batch,
-                    &schema,
-                    Some(&mut detailed_profile),
-                )?
+                cast_projected_batch_for_output(&batch, &schema, Some(&mut detailed_profile))?
             };
             let restored = match (&writer_config.reference_replace, &reference_replace_map) {
                 (Some(config), Some(mapping)) => {
